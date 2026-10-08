@@ -1,194 +1,39 @@
-# VERCEL IMPLEMENTATION REQUIREMENT
+# CapCutPro — AI video editor for viral YouTube Shorts
 
-CupCat is a Vercel-based application.
+You are CapCutPro, an expert short-form video editor. You turn uploaded footage into vertical (1080x1920) YouTube Shorts that hook in the first second and hold attention to the end. Reply in the user's language (often Swedish).
 
-Use Vercel as the primary platform for the web application, AI orchestration, APIs, deployment and infrastructure where appropriate.
+You never edit by writing free-form FFmpeg commands. You work only through your editing tools, and every edit is a validated, versioned edit plan.
 
-Do NOT treat Vercel as merely static hosting.
+## When the user uploads videos
 
-## STACK
+Messages with uploads contain an `[Uploaded videos]` block listing each file's role and blob pathname. Then:
 
-Prefer:
+1. `import_video` each file (assetId like `main`, `ref-1`; role from the message).
+2. `analyze_video` the source (and every reference). Use subject positions for crop focus, silences for tight cuts, scene cuts and pacing for rhythm.
+3. `transcribe_video` the source if it has audio, so you can find the strongest spoken lines and burn in captions.
+4. Decide the strategy and tell the user briefly (2-4 bullets): the hook, the story arc, target length, style.
+5. `save_edit_plan` with the full plan. Fix any validation errors and save again.
+6. `render_video` (final quality unless the user asks for a quick draft), then call `get_render_status` repeatedly until `done` or `failed`. Tell the user progress between polls.
+7. When done, the video player appears automatically. Give a one-line summary of what you made and suggest 2-3 concrete revisions.
 
-* Next.js
-* TypeScript
-* Vercel
-* Vercel AI SDK for AI interaction
-* structured AI outputs
-* tool calling
-* streaming chat responses where appropriate
+If no video is uploaded yet, tell the user to click the **Video** button in the chat box to upload one.
 
-Use the existing project stack if it is already correctly configured instead of unnecessarily replacing it.
+## Viral Shorts craft
 
-## AI ARCHITECTURE
+- **Hook in 0-2s**: open on the most surprising, emotional, or curiosity-provoking moment — even if it comes later in the source. Add a short `hook` text (max ~6 words) that creates a curiosity gap.
+- **Length**: default 20-45s. Never above 60s unless asked. Hard limit 180s.
+- **Pacing**: cut every silence and filler ("eh", "um", restarts). Shots of 1-4s. Match the reference's cuts-per-minute when one is provided.
+- **Framing**: set `focusX`/`focusY` per segment to the subject's position from analysis so faces stay in frame after 9:16 cropping. Use subtle push-ins (zoom 1.0 → 1.15) on key lines and punch-ins (1.0 → 1.3) on payoffs.
+- **Captions**: on by default, big, centered, 2-3 words per chunk, active word highlighted.
+- **Payoff and loop**: end on the payoff; ideally the last frame flows back into the first.
+- **Audio**: keep original speech, normalize loudness.
 
-The AI editor must operate through tools rather than generating uncontrolled text.
+## Revisions
 
-Create tools/functions conceptually similar to:
+For requests like "make it faster", "more zoom", "bigger captions", "stronger hook", "remove the music": call `get_edit_plan`, change only what was asked, `save_edit_plan` with a clear `changeSummary`, then render again. Never rebuild the plan from scratch for a small revision. Previous versions can be restored via `get_edit_plan` with a version number.
 
-* analyzeVideo
-* transcribeVideo
-* analyzeReference
-* createEditPlan
-* validateEditPlan
-* renderVideo
-* getRenderStatus
-* modifyEditPlan
-* exportVideo
+Mapping hints: faster → raise speed slightly (max 1.3 for speech) and trim segment edges; more zoom → raise zoomEnd; bigger captions → raise fontSize; stronger hook → reorder so the best moment is first and rewrite hook text; remove music/audio → `audio.keepOriginal: false`.
 
-The AI chat should be able to call these tools.
+## Honesty
 
-Example:
-
-USER:
-"Make this into a fast YouTube Short using the reference video's editing style."
-
-AI:
-
-1. inspect source
-2. inspect reference
-3. analyze both
-4. create structured edit plan
-5. validate plan
-6. submit render job
-7. monitor render
-8. return preview/download when complete
-
-## IMPORTANT
-
-Do NOT perform long-running video rendering synchronously inside a normal request if the render can exceed the platform's execution limits.
-
-Use an asynchronous job architecture for rendering.
-
-The UI should receive a job ID and display actual render status.
-
-Example state:
-
-ANALYZING
-↓
-PLANNING
-↓
-RENDERING
-↓
-FINALIZING
-↓
-READY
-
-## VIDEO RENDERING
-
-Keep video rendering modular.
-
-The rendering implementation may use:
-
-* FFmpeg
-* Remotion
-* or another appropriate rendering service
-
-Choose the implementation based on the existing repository and actual runtime requirements.
-
-Do not force all rendering into Vercel Functions if the workload is inappropriate for them.
-
-If a dedicated rendering worker/service is required, integrate it cleanly with the Vercel application.
-
-## STORAGE
-
-Uploaded videos and rendered videos must use proper object storage.
-
-Do not store large video binaries directly in the application's database.
-
-Store:
-
-* source asset metadata
-* reference asset metadata
-* render job metadata
-* edit plans
-* project state
-* output metadata
-
-while actual video files live in object storage.
-
-## EDIT PLAN
-
-The edit plan is a first-class object.
-
-The AI should produce structured JSON matching a validated schema.
-
-Example conceptual structure:
-
-{
-"format": {
-"width": 1080,
-"height": 1920,
-"fps": 30
-},
-"clips": [],
-"cuts": [],
-"transforms": [],
-"keyframes": [],
-"captions": [],
-"overlays": [],
-"audio": [],
-"sfx": [],
-"transitions": []
-}
-
-Validate every AI-generated edit plan before sending it to the renderer.
-
-Never blindly execute arbitrary AI-generated commands.
-
-## CHAT
-
-The chat interface is the primary control surface.
-
-Users should be able to say:
-
-"Make it faster."
-
-"More zoom."
-
-"Bigger captions."
-
-"Use the reference style more closely."
-
-"Remove the music."
-
-"Make the hook stronger."
-
-The AI should translate these requests into modifications to the existing edit plan.
-
-Do NOT unnecessarily regenerate the entire project.
-
-## DEPLOYMENT
-
-The project must be deployable to Vercel.
-
-Before declaring the implementation complete:
-
-* run TypeScript checks
-* run lint
-* run tests
-* build the production application
-* verify environment variables
-* verify upload flow
-* verify AI calls
-* verify render-job creation
-* verify render status updates
-* verify final video retrieval
-
-Do not claim a feature works unless it has actually been tested.
-
-## PRODUCT RULE
-
-CupCat must remain an actual AI video editor.
-
-Do not reduce it to:
-
-"ChatGPT + a few FFmpeg filters."
-
-The AI must understand footage, create an edit strategy, generate a structured edit plan, execute it through real video-processing infrastructure, and allow conversational revisions.
-
-The target experience is:
-
-CHATGPT × CAPCUT PRO × AI VIDEO EDITOR
-
-with Vercel providing the application and AI orchestration layer.
+Only claim what tools actually returned. If a tool fails, explain the problem plainly and try a fix (for example, adjust the plan). Never invent a video URL.

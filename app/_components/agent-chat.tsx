@@ -2,7 +2,7 @@
 
 import type { UserContent } from "ai";
 import { useEveAgent } from "eve/react";
-import { AlertCircleIcon, BrainIcon, PlusIcon, SquareIcon } from "lucide-react";
+import { AlertCircleIcon, BrainIcon, FilmIcon, PlusIcon, SquareIcon, XIcon } from "lucide-react";
 import { useState } from "react";
 import {
   Conversation,
@@ -23,6 +23,14 @@ import { Shimmer } from "@/components/ai-elements/shimmer";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { AgentMessage } from "./agent-message";
+import { type UploadedVideo, VideoUploadButton } from "./video-upload-button";
+
+function describeVideos(videos: readonly UploadedVideo[]): string {
+  const lines = videos.map(
+    (v) => `- ${v.role === "source" ? "Source footage" : "Style reference"}: ${v.filename} (blob pathname: ${v.pathname})`,
+  );
+  return `[Uploaded videos]\n${lines.join("\n")}`;
+}
 
 const AGENT_NAME = "capcutpro";
 
@@ -35,6 +43,8 @@ export function AgentChat({
 }) {
   const [cancellationError, setCancellationError] = useState<string>();
   const [hasInputText, setHasInputText] = useState(false);
+  const [videos, setVideos] = useState<UploadedVideo[]>([]);
+  const [uploadError, setUploadError] = useState<string>();
   const agent = useEveAgent({
     initialSession:
       sessionId === undefined
@@ -81,10 +91,16 @@ export function AgentChat({
   };
 
   const handleSubmit = async (message: PromptInputMessage) => {
-    const text = message.text.trim();
-    if ((text.length === 0 && message.files.length === 0) || isResuming) return;
+    const typed = message.text.trim();
+    if ((typed.length === 0 && message.files.length === 0 && videos.length === 0) || isResuming) return;
+    const text =
+      videos.length > 0
+        ? `${typed || "Gör ett viralt YouTube Short av den här videon."}\n\n${describeVideos(videos)}`
+        : typed;
 
     setHasInputText(false);
+    setVideos([]);
+    setUploadError(undefined);
     setCancellationError(undefined);
     const options = isBusy ? { turnPolicy: "steer" as const } : undefined;
 
@@ -111,13 +127,66 @@ export function AgentChat({
 
   const composer = (
     <PromptInput onSubmit={handleSubmit}>
+      {videos.length > 0 ? (
+        <ul className="flex w-full flex-wrap gap-2 px-3 pt-3" aria-label="Uppladdade videor">
+          {videos.map((video, index) => (
+            <li
+              className="flex items-center gap-2 rounded-md border bg-muted/50 py-1 pr-1 pl-2 text-xs"
+              key={video.pathname}
+            >
+              <FilmIcon className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="max-w-40 truncate">{video.filename}</span>
+              <button
+                className="rounded px-1.5 py-0.5 font-medium text-muted-foreground hover:bg-background hover:text-foreground"
+                onClick={() =>
+                  setVideos((current) =>
+                    current.map((v, i) =>
+                      i === index ? { ...v, role: v.role === "source" ? "reference" : "source" } : v,
+                    ),
+                  )
+                }
+                title="Växla mellan källmaterial och stilreferens"
+                type="button"
+              >
+                {video.role === "source" ? "Källa" : "Referens"}
+              </button>
+              <button
+                aria-label={`Ta bort ${video.filename}`}
+                className="rounded p-0.5 text-muted-foreground hover:bg-background hover:text-foreground"
+                onClick={() => setVideos((current) => current.filter((_, i) => i !== index))}
+                type="button"
+              >
+                <XIcon className="size-3.5" />
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {uploadError ? (
+        <p className="px-3 pt-2 text-destructive text-xs" role="alert">
+          {uploadError}
+        </p>
+      ) : null}
       <PromptInputTextarea
         disabled={isResuming}
         onChange={(event) => setHasInputText(event.currentTarget.value.trim().length > 0)}
-        placeholder="Send a message…"
+        placeholder={videos.length > 0 ? "Beskriv klippet du vill ha…" : "Ladda upp en video eller skriv ett meddelande…"}
       />
+      <div className="flex items-center px-2 pb-2">
+        <VideoUploadButton
+          disabled={isResuming}
+          onError={setUploadError}
+          onUploaded={(video) => {
+            setUploadError(undefined);
+            setVideos((current) => [
+              ...current,
+              { ...video, role: current.some((v) => v.role === "source") ? "reference" : "source" },
+            ]);
+          }}
+        />
+      </div>
       <ComposerAction
-        hasInputText={hasInputText}
+        hasInputText={hasInputText || videos.length > 0}
         isBusy={isBusy}
         isResuming={isResuming}
         onCancel={requestCancellation}

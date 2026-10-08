@@ -134,7 +134,11 @@ function AgentMessagePart({
         );
       }
 
+      const renderedVideoUrl = getRenderedVideoUrl(part.toolName, part.output);
+
       return (
+        <>
+        {renderedVideoUrl ? <RenderedVideo url={renderedVideoUrl} /> : null}
         <Tool
           defaultOpen={part.state === "approval-requested" || part.state === "approval-responded"}
         >
@@ -160,9 +164,37 @@ function AgentMessagePart({
             )}
           </ToolContent>
         </Tool>
+        </>
       );
     }
   }
+}
+
+function getRenderedVideoUrl(toolName: string, output: unknown): string | undefined {
+  if (toolName !== "get_render_status" || typeof output !== "object" || output === null) return undefined;
+  const { status, videoUrl } = output as { status?: unknown; videoUrl?: unknown };
+  return status === "done" && typeof videoUrl === "string" && videoUrl.startsWith("/api/file?")
+    ? videoUrl
+    : undefined;
+}
+
+function RenderedVideo({ url }: { readonly url: string }) {
+  return (
+    <figure className="flex w-full flex-col items-start gap-2">
+      <video
+        className="aspect-[9/16] w-full max-w-xs rounded-lg border bg-black"
+        controls
+        playsInline
+        preload="metadata"
+        src={url}
+      >
+        <track kind="captions" />
+      </video>
+      <a className="text-sm underline underline-offset-4" download href={`${url}&download=1`}>
+        Ladda ner MP4
+      </a>
+    </figure>
+  );
 }
 
 function QuestionRequest({
