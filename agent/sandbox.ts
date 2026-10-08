@@ -9,7 +9,16 @@ export const FONTS_DIR = "/opt/fonts";
 const PREPARE_SCRIPT = `
 set -euo pipefail
 cd /tmp
-command -v xz >/dev/null || sudo dnf install -y -q xz tar
+if command -v dnf >/dev/null 2>&1; then
+  sudo dnf install -y -q xz tar curl
+elif command -v yum >/dev/null 2>&1; then
+  sudo yum install -y -q xz tar curl
+elif command -v apt-get >/dev/null 2>&1; then
+  sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils tar curl
+else
+  echo "Ingen känd pakethanterare hittades" >&2
+  exit 1
+fi
 curl -fsSL -o ffmpeg.tar.xz ${FFMPEG_URL}
 mkdir -p ffmpeg && tar -xJf ffmpeg.tar.xz -C ffmpeg --strip-components=1
 sudo install -m 0755 ffmpeg/ffmpeg ffmpeg/ffprobe /usr/local/bin/
@@ -18,18 +27,5 @@ sudo mkdir -p ${FONTS_DIR}
 sudo curl -fsSL -o ${FONTS_DIR}/Anton-Regular.ttf ${CAPTION_FONT_URL}
 ffmpeg -hide_banner -version | head -1
 `;
-
-export const environment = VercelSandbox.environment({
-  prepare: async (sandbox) => {
-    const result = await sandbox.run({ command: `bash -c '${PREPARE_SCRIPT.replaceAll("'", "'\\''")}'` });
-    if (result.exitCode !== 0) {
-      throw new Error(`FFmpeg installation failed: ${result.stderr || result.stdout}`);
-    }
-  },
-});
-
-export default defineSandbox(() =>
-  environment.open({
-    resources: { vcpus: 4 },
   }),
 );
