@@ -27,5 +27,21 @@ sudo mkdir -p ${FONTS_DIR}
 sudo curl -fsSL -o ${FONTS_DIR}/Anton-Regular.ttf ${CAPTION_FONT_URL}
 ffmpeg -hide_banner -version | head -1
 `;
+
+export const environment = VercelSandbox.environment({
+  prepare: async (sandbox) => {
+    const result = await sandbox.run({ command: `bash -c '${PREPARE_SCRIPT.replaceAll("'", "'\\''")}'` });
+    if (result.exitCode !== 0) {
+      throw new Error(`FFmpeg installation failed: ${result.stderr || result.stdout}`);
+    }
+  },
+});
+
+export default defineSandbox(() =>
+  environment.open({
+    resources: { vcpus: 4 },
+  }),
+);
+`;
   }),
 );
