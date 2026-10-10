@@ -238,7 +238,15 @@ def run_turn(project, text: str, on_event: EventFn, llm: OpenAI | None = None, f
     if rendered is None and project.editor.plan["clips"] and not wants_undo:
         rendered = _force_commit(project, on_event, trace, force_render)
 
-    if rendered and (not final or len(final) > 400):
+    if rendered and rendered.get("note"):
+        final = str(rendered["note"])
+    elif rendered and getattr(project, "_restyle_applied", False):
+        lines = project.editor.plan["captions"]
+        final = (
+            f"Textstorleken är nu {project.editor.plan['style']['captionFontSize']}. "
+            f"Alla {len(lines)} textrader är kvar."
+        )
+    elif rendered and (not final or len(final) > 400):
         final = _summarize(llm, messages, rendered)
     if not final:
         final = "Jag kunde inte göra en ändring. Säg om vad du vill ändra."
@@ -276,8 +284,14 @@ def dispatch(project, name: str, args: dict, on_event: EventFn) -> dict:
                 return {"ok": False, "error": "Analys saknas."}
             return {"ok": True, "faces": summary_for_model(editor.analysis)["faces"]}
         if name == "select_clip":
+            unread = project.read_source_duration()
+            if unread:
+                return unread
             return editor.select_clip(args["sourceStart"], args["sourceEnd"], args.get("speed") or 1, args.get("label") or "", args.get("insertAt"))
         if name == "trim_clip":
+            unread = project.read_source_duration()
+            if unread:
+                return unread
             return editor.trim_clip(args["clipId"], args.get("sourceStart"), args.get("sourceEnd"))
         if name == "delete_timeline_range":
             return editor.delete_timeline_range(args["start"], args["end"])

@@ -107,8 +107,26 @@ class Project:
         from .analysis import summary_for_model
         return {"ok": True, "analysis": summary_for_model(analysis)}
 
+    def read_source_duration(self) -> dict | None:
+        """Probe the original file. A clip plan is not created from a guessed length."""
+        try:
+            meta = video_meta(self.original)
+        except Exception as error:
+            return {"ok": False, "error": f"Videons längd kunde inte läsas från filen ({error}). Ingen klippplan skapas."}
+        duration = float(meta.get("duration") or 0)
+        if duration <= 0:
+            return {"ok": False, "error": "Videons längd kunde inte läsas från filen. Ingen klippplan skapas."}
+        self.editor.file_duration = duration
+        source = (self.editor.analysis or {}).get("source")
+        if isinstance(source, dict):
+            source["duration"] = round(duration, 3)
+        return None
+
     def commit(self, on_event, force: bool = False) -> dict:
         del force  # Hard checks always run. An invalid plan is not rendered as the whole original.
+        unread = self.read_source_duration()
+        if unread:
+            return unread
         apply_restyle(self)
         prepared = prepare_for_render(self.editor, first_cut=not self.editor.versions)
         if not prepared["ok"]:
@@ -150,7 +168,9 @@ class Project:
             "videoUrl": f"/projects/{self.id}/versions/{version}/video",
             "probe": probe,
             "outputDuration": round(total, 3),
-            "summary": f"v{version} rendered, {probe['duration']:.1f}s, {probe['width']}x{probe['height']} {probe['videoCodec']}.",
+            "summary": prepared.get("note") or f"v{version} rendered, {probe['duration']:.1f}s, {probe['width']}x{probe['height']} {probe['videoCodec']}.",
+            "note": prepared.get("note"),
+            "replaced": bool(prepared.get("note")),
         }
 
 

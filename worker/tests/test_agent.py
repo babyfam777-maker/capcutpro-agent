@@ -78,7 +78,7 @@ def test_loose_tool_call_parser():
 def test_agent_loop_mutates_plan_and_commits(tmp_path: Path):
     source = tmp_path / "in.mp4"
     subprocess.check_call(
-        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
         stdout=subprocess.DEVNULL,
     )
     project = Store(tmp_path / "projects").create("in.mp4", source)
@@ -102,7 +102,7 @@ def test_agent_loop_mutates_plan_and_commits(tmp_path: Path):
 def test_stalled_model_still_commits_a_plan_from_analysis(tmp_path: Path):
     source = tmp_path / "in.mp4"
     subprocess.check_call(
-        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
         stdout=subprocess.DEVNULL,
     )
     project = Store(tmp_path / "projects").create("in.mp4", source)
@@ -131,7 +131,7 @@ def test_stalled_model_still_commits_a_plan_from_analysis(tmp_path: Path):
 def test_bigger_text_keeps_lines_even_if_the_model_replaces_them(tmp_path: Path):
     source = tmp_path / "in.mp4"
     subprocess.check_call(
-        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
         stdout=subprocess.DEVNULL,
     )
     project = Store(tmp_path / "projects").create("in.mp4", source)
@@ -168,7 +168,7 @@ def test_bigger_text_keeps_lines_even_if_the_model_replaces_them(tmp_path: Path)
 def test_undo_message_steps_back_without_a_new_render(tmp_path: Path):
     source = tmp_path / "in.mp4"
     subprocess.check_call(
-        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
         stdout=subprocess.DEVNULL,
     )
     project = Store(tmp_path / "projects").create("in.mp4", source)

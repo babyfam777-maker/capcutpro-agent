@@ -98,9 +98,66 @@ def test_text_needs_a_real_time_span():
     ed = Editor(copy.deepcopy(ZEN))
     zero = ed.add_text(0.2, 0.2, "Wow")
     assert zero["ok"] is False
-    assert "0,2" in zero["error"]
+    assert ed.plan["effects"] == []
+    flash = ed.add_text(0.2, 0.4, "Wow!")
+    assert flash["ok"] is False
+    assert "läsas" in flash["error"]
     assert ed.plan["effects"] == []
     assert ed.add_text(0.0, 0.9, "STOP", accent="STOP")["ok"]
+
+
+MET_WORDS = [
+    ("on", 0.0, 0.76), ("tour", 0.76, 1.08), ("some", 1.08, 1.30), ("hey", 1.30, 1.72),
+    ("I'm", 1.72, 2.50), ("gonna", 2.50, 2.60), ("go", 2.60, 2.82),
+    ("I'm", 4.52, 5.36), ("gonna", 5.36, 5.72), ("go", 5.72, 5.82),
+    ("I'm", 5.82, 6.20), ("gonna", 6.20, 6.20), ("go", 6.20, 7.20),
+    ("You", 7.20, 7.20), ("look", 7.20, 7.62), ("beautiful", 7.62, 8.32),
+    ("You", 8.32, 9.02), ("look", 9.02, 9.26), ("beautiful", 9.26, 9.46),
+    ("We're", 9.46, 9.70), ("all", 9.70, 9.84), ("crying", 9.84, 10.32),
+    ("That", 10.32, 10.86), ("is", 10.86, 12.66), ("gorgeous", 12.66, 14.74),
+]
+
+
+def _met():
+    return {
+        "source": {"duration": 15.139, "width": 1080, "height": 1920, "fps": 60, "hasAudio": True},
+        "faces": [{"id": "face_1", "screenTime": 3, "avg": {"x": 0.5, "y": 0.4}, "samples": []}],
+        "transcript": {"text": "on tour some hey", "words": [{"text": t, "start": a, "end": b} for t, a, b in MET_WORDS]},
+        "silences": [],
+        "silenceTotal": 0,
+        "scenes": [6.533, 7.65, 9.167, 12.133],
+        "moments": [
+            {"start": 9.0, "end": 9.5, "score": 1.96, "reasons": ["speech", "face", "scene-cut"], "text": "look beautiful"},
+            {"start": 7.5, "end": 8.0, "score": 1.889, "reasons": ["speech", "face", "scene-cut"], "text": "beautiful"},
+            {"start": 10.5, "end": 11.0, "score": 1.695, "reasons": ["speech", "face"], "text": "That"},
+        ],
+    }
+
+
+def test_one_second_slice_of_a_long_speech_is_replaced():
+    from app.auto_edit import content_problems
+    from app.plan_ops import timeline
+
+    ed = Editor(_met())
+    picked = ed.select_clip(1.0, 2.0)
+    assert picked["ok"]
+    assert picked["warning"]
+    assert "orimlig" in picked["warning"] or "ögonblick" in picked["warning"]
+    problems = content_problems(ed)
+    assert problems
+    prepared = prepare_for_render(ed, first_cut=True)
+    assert prepared["ok"], prepared
+    assert "avvisades" in prepared["note"]
+    assert "1.00" in prepared["note"] or "1,00" in prepared["note"]
+    _, total = timeline(ed.plan)
+    assert total > 10
+    assert ed.plan["clips"][0]["label"] == "hook"
+    assert 8.0 <= ed.plan["clips"][0]["sourceStart"] <= 9.2
+    assert ed.plan["audio"]["keepOriginal"] is True
+    assert ed.plan["audio"]["music"] is False
+    assert not any(item["type"] == "sound_effect" for item in ed.plan["effects"])
+    for sample in (0.3, 1.0, 3.0):
+        assert text_visible(ed.plan, sample), sample
 
 
 def test_size_change_keeps_existing_lines():

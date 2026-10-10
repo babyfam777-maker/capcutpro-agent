@@ -67,6 +67,7 @@ class Editor:
         self.versions: list[dict] = []
         self.active: int | None = None
         self.dirty = False
+        self.file_duration: float | None = None
 
     def snapshot(self) -> None:
         self.undo_stack.append(copy.deepcopy(self.plan))
@@ -75,6 +76,8 @@ class Editor:
         self.plan["revision"] = int(self.plan.get("revision") or 0) + 1
 
     def _duration(self) -> float:
+        if self.file_duration:
+            return float(self.file_duration)
         if not self.analysis:
             return 0.0
         return float(self.analysis["source"]["duration"])
@@ -96,6 +99,8 @@ class Editor:
         if err:
             return err
         duration = self._duration()
+        if duration <= 0:
+            return {"ok": False, "error": "Videons längd är inte läst från filen. Ingen klippplan skapas."}
         start, end = _as_seconds(source_start, source_end, duration)
         outside = _outside_source(start, end, duration)
         if outside:
@@ -124,11 +129,17 @@ class Editor:
         else:
             self.plan["clips"].insert(max(0, insert_at), clip)
         _, total = timeline(self.plan)
+        from .auto_edit import content_problems
+
+        warning = content_problems(self)
         if total > MAX_SHORT:
             self.plan = self.undo_stack.pop()
             self.dirty = bool(self.undo_stack)
             return {"ok": False, "error": f"Tidslinjen blir {total:.1f}s. Shorts här max {MAX_SHORT:.0f}s."}
-        return {"ok": True, "clip": clip, "outputDuration": round(total, 2)}
+        result = {"ok": True, "clip": clip, "outputDuration": round(total, 2)}
+        if warning:
+            result["warning"] = " ".join(warning)
+        return result
 
     def trim_clip(self, clip_id: str, source_start: float | None = None, source_end: float | None = None) -> dict:
         clip = self._clip(clip_id)
@@ -311,7 +322,7 @@ class Editor:
         return {"ok": True, "clipId": clip["id"], "focusTrack": clip.get("focusTrack"), "focusX": clip["focusX"], "focusY": clip["focusY"]}
 
     def add_caption(self, start: float, end: float, text: str, accent: str | None = None, font_size: int | None = None) -> dict:
-        problem = lint_text(text) or _text_time_error(start, end)
+        problem = lint_text(text) or _text_time_error(start, end, text)
         if problem:
             return {"ok": False, "error": problem}
         cap = {
@@ -375,7 +386,7 @@ class Editor:
         }
 
     def add_text(self, start: float, end: float, text: str, accent: str | None = None, kind: str = "headline", font_size: int | None = None) -> dict:
-        problem = lint_text(text) or _text_time_error(start, end)
+        problem = lint_text(text) or _text_time_error(start, end, text)
         if problem:
             return {"ok": False, "error": problem}
         kind = kind if kind in ("headline", "story", "bubble") else "headline"
@@ -438,7 +449,7 @@ class Editor:
         return {"ok": True, "effect": effect}
 
     def add_badge(self, start: float, end: float, text: str) -> dict:
-        problem = lint_text(text) or _text_time_error(start, end)
+        problem = lint_text(text) or _text_time_error(start, end, text)
         if problem:
             return {"ok": False, "error": problem}
         effect = {
@@ -617,15 +628,26 @@ def _overlaps_existing(clips: list[dict], start: float, end: float, slop: float 
     return None
 
 
-def _text_time_error(start: float, end: float) -> str | None:
+def min_readable_seconds(text: str) -> float:
+    """A one-word line such as 'Wow!' has to stay up long enough to be read."""
+    words = [word for word in str(text).split() if any(ch.isalnum() for ch in word)]
+    return max(0.8, 0.28 * max(1, len(words)))
+
+
+def _text_time_error(start: float, end: float, text: str = "") -> str | None:
     try:
         start, end = float(start), float(end)
     except (TypeError, ValueError):
         return "Textens tid måste vara ett tal."
     if start < -0.05:
         return "Texten kan inte börja före 0 sekunder."
-    if end - start < 0.2:
-        return "Texten måste ha en giltig längd på minst 0,2 sekunder. Den här tiden skulle inte synas."
+    need = min_readable_seconds(text) if str(text).strip() else 0.8
+    if end - start + 1e-3 < need:
+        shown = str(text).strip() or "text"
+        return (
+            f"Texten \"{shown}\" är bara {end - start:.2f} s och hinner inte läsas. "
+            f"Den behöver minst {need:.1f} s."
+        )
     return None
 
 

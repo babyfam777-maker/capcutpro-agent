@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .plan_ops import _id, _primary_track, captions_from_words, timeline
+from .plan_ops import _id, _primary_track, captions_from_words, min_readable_seconds, timeline
 
 MIN_CLIP = 0.2
 # A fraction of a second past the probed duration is rounding, not a different video.
@@ -26,26 +26,39 @@ def build_auto_plan(analysis: dict | None) -> dict[str, Any]:
     start, end = content
     pieces = _without_internal_silence(start, end, analysis, words)
     hook = confirmed_hook(analysis, start, end, words)
-    ranges: list[tuple[float, float, str]] = []
+    ranges: list[tuple[float, float, str, str]] = []
     if hook:
         kept: list[tuple[float, float]] = []
         for piece_start, piece_end in pieces:
             kept.extend(_subtract(piece_start, piece_end, hook["sourceStart"], hook["sourceEnd"]))
-        ranges.append((hook["sourceStart"], hook["sourceEnd"], "hook"))
-        ranges.extend((a, b, "kept") for a, b in kept if b - a >= MIN_CLIP)
+        hook_reason = (
+            f"Starkaste ögonblicket är {hook['momentStart']:.2f}–{hook['momentEnd']:.2f} s "
+            f"({hook['text'] or 'rörelse'}; {', '.join(hook['reasons'])}; poäng {hook['score']}). "
+            f"Klippet börjar {hook['sourceStart']:.2f} s så orden i det ögonblicket inte kapas."
+        )
+        ranges.append((hook["sourceStart"], hook["sourceEnd"], "hook", hook_reason))
+        ranges.extend(
+            (a, b, "kept", "Repliker och händelser runt öppningen. De tas inte bort bara för att göra klippet kort.")
+            for a, b in kept
+            if b - a >= MIN_CLIP
+        )
     else:
-        ranges.extend((a, b, "kept") for a, b in pieces if b - a >= MIN_CLIP)
+        ranges.extend(
+            (a, b, "kept", "Så här långt sträcker sig talet eller det starkaste ögonblicket. Inget senare ögonblick var starkt nog att flyttas först.")
+            for a, b in pieces
+            if b - a >= MIN_CLIP
+        )
     if not ranges:
         return _fail("Inga giltiga klipp kunde byggas. Originalvideon används inte som reserv.")
-    removed = _uncovered(duration, [(a, b) for a, b, _ in ranges])
+    removed = _removed_spans(duration, [(a, b) for a, b, _, _ in ranges], words)
     return {
         "ok": True,
         "clips": [
-            {"sourceStart": round(a, 3), "sourceEnd": round(b, 3), "label": label}
-            for a, b, label in ranges
+            {"sourceStart": round(a, 3), "sourceEnd": round(b, 3), "label": label, "reason": reason}
+            for a, b, label, reason in ranges
         ],
         "hook": hook,
-        "removed": [{"start": round(a, 3), "end": round(b, 3)} for a, b in removed if b - a >= MIN_CLIP],
+        "removed": [{"start": round(a, 3), "end": round(b, 3), "reason": why} for a, b, why in removed if b - a >= MIN_CLIP],
     }
 
 
@@ -109,6 +122,7 @@ def apply_auto_plan(editor, built: dict) -> None:
             "focusY": 0.45,
             "focusTrack": focus,
             "label": spec["label"],
+            "reason": spec.get("reason") or "",
         }
         for spec in built["clips"]
     ]
@@ -125,20 +139,144 @@ def apply_auto_plan(editor, built: dict) -> None:
 
 
 def prepare_for_render(editor, *, first_cut: bool) -> dict[str, Any]:
-    """Make the first render a real cut, and refuse a plan that still cannot be shown."""
-    if first_cut:
+    """Use a content-based cut on the first render. Never export a plan that drops the speech."""
+    note = None
+    if first_cut or not editor.plan["clips"]:
+        model_clips = copy.deepcopy(editor.plan["clips"])
+        rejected = clip_problems(editor) + content_problems(editor) if model_clips else [
+            "Planen är tom. Det finns inga klipp, och originalvideon används inte som reserv.",
+        ]
         built = build_auto_plan(editor.analysis)
         if not built.get("ok"):
-            return {"ok": False, "error": built["error"], "problems": [built["error"]]}
+            problems = rejected + [built["error"]]
+            return {"ok": False, "error": _join(problems), "problems": problems}
         apply_auto_plan(editor, built)
-    problems = clip_problems(editor)
+        note = _replacement_note(model_clips, rejected, built)
+        editor.plan["autoEdit"]["note"] = note
+        editor.plan["autoEdit"]["modelClips"] = [
+            {"sourceStart": clip.get("sourceStart"), "sourceEnd": clip.get("sourceEnd")} for clip in model_clips
+        ]
+    else:
+        rejected = clip_problems(editor) + content_problems(editor)
+        if rejected:
+            return {"ok": False, "error": _join(rejected), "problems": rejected}
+    problems = clip_problems(editor) + content_problems(editor)
     if problems:
         return {"ok": False, "error": _join(problems), "problems": problems}
     ensure_text(editor.plan)
     problems = text_problems(editor.plan)
     if problems:
         return {"ok": False, "error": _join(problems), "problems": problems}
-    return {"ok": True}
+    return {"ok": True, "note": note}
+
+
+def content_problems(editor) -> list[str]:
+    """A short slice is refused when it leaves out most of the speech or every strong moment."""
+    analysis = editor.analysis
+    clips = editor.plan.get("clips") or []
+    if not analysis or not clips:
+        return []
+    span = _meaningful_span(analysis)
+    if span is None:
+        return ["Analysen har inget tal eller ögonblick att behålla. Den här planen kan inte användas."]
+    start, end = span
+    length = end - start
+    covered = _covered_between(clips, start, end)
+    problems = []
+    if length >= 3 and covered < length * 0.5:
+        problems.append(
+            f"Klippet behåller {covered:.1f} s av {length:.1f} s innehåll "
+            f"(från {start:.2f} s till {end:.2f} s). Det mesta av videons tal eller händelser skulle försvinna, "
+            "så den här längden är orimlig för den här filen."
+        )
+    moments = _strong_moments(analysis)
+    if moments and length >= 3 and not any(_covered_between(clips, float(moment["start"]), float(moment["end"])) > 0.05 for moment in moments):
+        listed = ", ".join(
+            f"{float(moment['start']):.1f}–{float(moment['end']):.1f} s ({moment.get('text') or 'ögonblick'})"
+            for moment in moments[:3]
+        )
+        problems.append(f"Inget klipp träffar de starka ögonblicken i analysen: {listed}.")
+    return problems
+
+
+def _replacement_note(model_clips: list[dict], rejected: list[str], built: dict) -> str:
+    parts = []
+    if model_clips and rejected:
+        spans = ", ".join(f"{float(clip['sourceStart']):.2f}–{float(clip['sourceEnd']):.2f} s" for clip in model_clips)
+        parts.append(f"Modellens klipp ({spans}) avvisades. {' '.join(rejected)}")
+    elif model_clips:
+        parts.append("Modellens tidsval användes inte. Klippningen gjordes från videons analys.")
+    else:
+        parts.append("Modellen lämnade ingen giltig klippplan. Klippningen gjordes från videons analys.")
+    hook = built.get("hook")
+    if hook:
+        parts.append(
+            f"Öppningen är {hook['sourceStart']:.2f}–{hook['sourceEnd']:.2f} s eftersom det starkaste ögonblicket är "
+            f"{hook['momentStart']:.2f}–{hook['momentEnd']:.2f} s ({hook.get('text') or 'ögonblick'}, "
+            f"{', '.join(hook['reasons'])}, poäng {hook['score']})."
+        )
+    else:
+        parts.append("Inget ögonblick var starkt nog att flyttas först, så det som behålls ligger i tidsordning.")
+    removed = built.get("removed") or []
+    if removed:
+        bits = ", ".join(f"{item['start']:.2f}–{item['end']:.2f} s" for item in removed)
+        parts.append(f"Borttaget: {bits}.")
+    _, total = timeline({"clips": [
+        {"sourceStart": clip["sourceStart"], "sourceEnd": clip["sourceEnd"], "speed": 1} for clip in built["clips"]
+    ]})
+    parts.append(f"Resultatet är {total:.1f} s. Originalets ljud är kvar. Ingen bakgrundsmusik.")
+    return " ".join(parts)
+
+
+def _meaningful_span(analysis: dict) -> tuple[float, float] | None:
+    words = ((analysis.get("transcript") or {}).get("words") or [])
+    if words:
+        return float(words[0]["start"]), float(words[-1]["end"])
+    moments = _strong_moments(analysis)
+    if not moments:
+        return None
+    return min(float(item["start"]) for item in moments), max(float(item["end"]) for item in moments)
+
+
+def _strong_moments(analysis: dict) -> list[dict]:
+    ranked = []
+    for moment in analysis.get("moments") or []:
+        reasons = set(moment.get("reasons") or [])
+        if "silence" in reasons:
+            continue
+        if float(moment.get("score") or 0) < 1:
+            continue
+        if not (reasons & {"speech", "motion", "face", "scene-cut"}):
+            continue
+        ranked.append(moment)
+    ranked.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
+    return ranked[:4]
+
+
+def _covered_between(clips: list[dict], start: float, end: float) -> float:
+    total = 0.0
+    for clip in clips:
+        left = max(start, float(clip["sourceStart"]))
+        right = min(end, float(clip["sourceEnd"]))
+        if right > left:
+            total += right - left
+    return total
+
+
+def _removed_spans(duration: float, spans: list[tuple[float, float]], words: list[dict]) -> list[tuple[float, float, str]]:
+    gaps = _uncovered(duration, spans)
+    first = float(words[0]["start"]) if words else None
+    last = float(words[-1]["end"]) if words else None
+    labeled = []
+    for start, end in gaps:
+        if first is not None and end <= first + 0.05:
+            why = "Dödtid före första repliken."
+        elif last is not None and start >= last - 0.05:
+            why = "Dödtid efter sista repliken."
+        else:
+            why = "Tystnad eller uppehåll utan replik."
+        labeled.append((start, end, why))
+    return labeled
 
 
 def clip_problems(editor) -> list[str]:
@@ -164,10 +302,12 @@ def clip_problems(editor) -> list[str]:
                 f"({left['sourceStart']}–{left['sourceEnd']} s och {right['sourceStart']}–{right['sourceEnd']} s)."
             )
     dead = removable_dead(editor.analysis) if editor.analysis else []
-    if duration and dead and _coverage(clips) >= duration * 0.92:
+    dead_total = sum(end - start for start, end in dead)
+    still_inside = sum(_covered_between(clips, start, end) for start, end in dead)
+    if dead_total >= 0.25 and still_inside >= dead_total * 0.8:
         spans = ", ".join(f"{start:.2f}–{end:.2f} s" for start, end in dead)
         problems.append(
-            f"Planen täcker i stort sett hela originalet trots dödtid ({spans}). Originalvideon används inte oförändrad."
+            f"Planen ligger kvar över dödtid ({spans}). Originalvideon används inte oförändrad."
         )
     return problems
 
@@ -180,8 +320,11 @@ def text_problems(plan: dict) -> list[str]:
     for item in items:
         start, end = float(item.get("start") or 0), float(item.get("end") or 0)
         label = str(item.get("text") or "text")[:40]
-        if end - start < MIN_CLIP or start < -TIME_SLOP:
-            problems.append(f"Texten \"{label}\" har ogiltig tid {start:.2f}–{end:.2f} s och skulle inte synas.")
+        need = min_readable_seconds(label) if item.get("type") in ("text", "badge") else MIN_CLIP
+        if end - start < need or start < -TIME_SLOP:
+            problems.append(
+                f"Texten \"{label}\" är {end - start:.2f} s ({start:.2f}–{end:.2f} s) och hinner inte läsas."
+            )
         elif total > 0 and start >= total - 0.01:
             problems.append(f"Texten \"{label}\" börjar efter filmens slut ({start:.2f} s, filmen är {total:.2f} s).")
     if total <= 0:
@@ -379,24 +522,6 @@ def _uncovered(duration: float, spans: list[tuple[float, float]]) -> list[tuple[
     if duration > cursor + 0.02:
         gaps.append((cursor, duration))
     return gaps
-
-
-def _coverage(clips: list[dict]) -> float:
-    spans = sorted((float(clip["sourceStart"]), float(clip["sourceEnd"])) for clip in clips)
-    total = 0.0
-    current: tuple[float, float] | None = None
-    for start, end in spans:
-        if current is None:
-            current = (start, end)
-            continue
-        if start <= current[1]:
-            current = (current[0], max(current[1], end))
-        else:
-            total += current[1] - current[0]
-            current = (start, end)
-    if current:
-        total += current[1] - current[0]
-    return total
 
 
 def _span_ok(item: dict) -> bool:
