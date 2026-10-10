@@ -99,6 +99,19 @@ def test_speed_rounding_cannot_make_a_phrase_unreadable(monkeypatch):
     assert not (story["end"] - story["start"] + 1e-3 < need)
 
 
+def test_echoed_model_reply_keeps_the_reaction_emoji(monkeypatch):
+    monkeypatch.setattr(
+        "app.mvp._ask_model",
+        lambda prompt, fallback: {"prompt": prompt, "fallback": fallback},
+    )
+    board = build_storyboard(_analysis(), "make a short")
+    assert board["fields"]["emoji"] == "😳"
+    assert board["fields"]["llm"] is False
+    assert board["fields"]["hook"] == "LOOK BEAUTIFUL"
+    plan = plan_from_storyboard(board, _analysis())
+    assert any(effect.get("type") == "emoji" and effect.get("emoji") == "😳" for effect in plan["effects"])
+
+
 def test_qa_flags_a_rejected_line(tmp_path, monkeypatch):
     monkeypatch.setattr("app.mvp._ask_model", lambda prompt, fallback: None)
     # QA on a missing file is not the point: check the text gate through the plan builder.

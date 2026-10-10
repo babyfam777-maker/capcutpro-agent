@@ -535,19 +535,16 @@ def _accept_fields(choice: dict | None, fallback: dict, reaction: bool, has_spee
         return fields
     hook = str(choice.get("hook") or "").strip().upper()
     accent = str(choice.get("accent") or "").strip().upper()
+    # A reply that does not repeat the chosen hook is not a constrained answer.
+    # qwen2.5:3b often echoes the user JSON, and missing keys must not wipe the fallback.
+    if hook != fallback["hook"] or accent != fallback["accent"] or lint_text(hook):
+        return fields
+    fields["llm"] = True
     emoji = str(choice.get("emoji") or "").strip()
-    bubble = str(choice.get("bubble") or "").strip().lower()
-    if hook == fallback["hook"] and accent == fallback["accent"] and not lint_text(hook):
-        fields["hook"] = hook
-        fields["accent"] = accent
-        fields["llm"] = True
-    if reaction and emoji in ("", "😳", "😅", "‼️", "🫣") and not (emoji and lint_emoji(emoji)):
+    if reaction and emoji in ("😳", "😅", "‼️", "🫣") and not lint_emoji(emoji):
         fields["emoji"] = emoji
-    elif not reaction:
-        fields["emoji"] = ""
-    if has_speech or bubble not in ("", "wait") or lint_text(bubble or "wait"):
-        fields["bubble"] = "" if has_speech else fields["bubble"]
-    else:
+    bubble = str(choice.get("bubble") or "").strip().lower()
+    if not has_speech and bubble == "wait" and not lint_text(bubble):
         fields["bubble"] = bubble
     if has_speech:
         fields["bubble"] = ""
