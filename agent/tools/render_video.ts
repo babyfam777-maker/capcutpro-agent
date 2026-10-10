@@ -43,7 +43,7 @@ export default defineTool({
     const quality = preview ? "-preset ultrafast -crf 30" : "-preset medium -crf 19";
     const script = [
       "#!/bin/sh",
-      `ffmpeg -hide_banner -y -nostats -i ${shellQuote(source.sourcePath)} -filter_complex_script graph.txt -map "[vout]" -map "[aout]" -c:v libx264 ${quality} -profile:v high -pix_fmt yuv420p -r ${plan.format.fps} -c:a aac -b:a 192k -ar 48000 -movflags +faststart -progress progress.txt output.mp4 > ffmpeg.log 2>&1`,
+      `ffmpeg -hide_banner -y -nostats -i ${shellQuote(source.sourcePath)} -filter_complex "$(cat graph.txt)" -map "[vout]" -map "[aout]" -c:v libx264 ${quality} -profile:v high -pix_fmt yuv420p -r ${plan.format.fps} -c:a aac -b:a 192k -ar 48000 -movflags +faststart -progress progress.txt output.mp4 > ffmpeg.log 2>&1`,
       "echo $? > exit_code",
     ].join("\n");
     await sandbox.writeTextFile({ path: `${dir}/render.sh`, content: script });
