@@ -67,6 +67,7 @@ class Editor:
         self.versions: list[dict] = []
         self.active: int | None = None
         self.dirty = False
+        self.file_duration: float | None = None
 
     def snapshot(self) -> None:
         self.undo_stack.append(copy.deepcopy(self.plan))
@@ -75,6 +76,8 @@ class Editor:
         self.plan["revision"] = int(self.plan.get("revision") or 0) + 1
 
     def _duration(self) -> float:
+        if self.file_duration:
+            return float(self.file_duration)
         if not self.analysis:
             return 0.0
         return float(self.analysis["source"]["duration"])
@@ -96,11 +99,17 @@ class Editor:
         if err:
             return err
         duration = self._duration()
+        if duration <= 0:
+            return {"ok": False, "error": "Videons längd är inte läst från filen. Ingen klippplan skapas."}
         start, end = _as_seconds(source_start, source_end, duration)
-        start = max(0.0, start)
-        end = min(duration, end)
+        outside = _outside_source(start, end, duration)
+        if outside:
+            return {"ok": False, "error": outside}
         if end - start < 0.2:
             return {"ok": False, "error": "Klippet måste vara minst 0,2 sekunder."}
+        overlap = _overlaps_existing(self.plan["clips"], start, end)
+        if overlap:
+            return {"ok": False, "error": overlap}
         speed = min(2.0, max(0.5, float(speed or 1)))
         clip = {
             "id": _id("c"),
@@ -120,11 +129,17 @@ class Editor:
         else:
             self.plan["clips"].insert(max(0, insert_at), clip)
         _, total = timeline(self.plan)
+        from .auto_edit import content_problems
+
+        warning = content_problems(self)
         if total > MAX_SHORT:
             self.plan = self.undo_stack.pop()
             self.dirty = bool(self.undo_stack)
             return {"ok": False, "error": f"Tidslinjen blir {total:.1f}s. Shorts här max {MAX_SHORT:.0f}s."}
-        return {"ok": True, "clip": clip, "outputDuration": round(total, 2)}
+        result = {"ok": True, "clip": clip, "outputDuration": round(total, 2)}
+        if warning:
+            result["warning"] = " ".join(warning)
+        return result
 
     def trim_clip(self, clip_id: str, source_start: float | None = None, source_end: float | None = None) -> dict:
         clip = self._clip(clip_id)
@@ -134,10 +149,15 @@ class Editor:
         start = float(clip["sourceStart"] if source_start is None else source_start)
         end = float(clip["sourceEnd"] if source_end is None else source_end)
         start, end = _as_seconds(start, end, duration)
-        start = max(0.0, start)
-        end = min(duration, end)
+        outside = _outside_source(start, end, duration)
+        if outside:
+            return {"ok": False, "error": outside}
         if end - start < 0.2:
             return {"ok": False, "error": "Klippet skulle bli kortare än 0,2s."}
+        others = [item for item in self.plan["clips"] if item["id"] != clip["id"]]
+        overlap = _overlaps_existing(others, start, end)
+        if overlap:
+            return {"ok": False, "error": overlap}
         self.snapshot()
         clip["sourceStart"] = round(start, 3)
         clip["sourceEnd"] = round(end, 3)
@@ -302,11 +322,9 @@ class Editor:
         return {"ok": True, "clipId": clip["id"], "focusTrack": clip.get("focusTrack"), "focusX": clip["focusX"], "focusY": clip["focusY"]}
 
     def add_caption(self, start: float, end: float, text: str, accent: str | None = None, font_size: int | None = None) -> dict:
-        problem = lint_text(text)
+        problem = lint_text(text) or _text_time_error(start, end, text)
         if problem:
             return {"ok": False, "error": problem}
-        if end <= start:
-            return {"ok": False, "error": "Caption måste ha en längd."}
         cap = {
             "id": _id("cap"),
             "start": round(float(start), 3),
@@ -336,6 +354,9 @@ class Editor:
             self.plan["style"]["captionFontSize"] = size
             for cap in self.plan["captions"]:
                 cap["fontSize"] = size
+        # A size change never replaces the lines. Sending both used to wipe every caption.
+        if captions is not None and (font_size or scale):
+            captions = None
         if captions is not None:
             clean = []
             for raw in captions:
@@ -365,7 +386,7 @@ class Editor:
         }
 
     def add_text(self, start: float, end: float, text: str, accent: str | None = None, kind: str = "headline", font_size: int | None = None) -> dict:
-        problem = lint_text(text)
+        problem = lint_text(text) or _text_time_error(start, end, text)
         if problem:
             return {"ok": False, "error": problem}
         kind = kind if kind in ("headline", "story", "bubble") else "headline"
@@ -428,7 +449,7 @@ class Editor:
         return {"ok": True, "effect": effect}
 
     def add_badge(self, start: float, end: float, text: str) -> dict:
-        problem = lint_text(text)
+        problem = lint_text(text) or _text_time_error(start, end, text)
         if problem:
             return {"ok": False, "error": problem}
         effect = {
@@ -586,6 +607,50 @@ def proposed_spans(analysis: dict | None) -> list[tuple[float, float]]:
     return spans
 
 
+def _outside_source(start: float, end: float, duration: float) -> str | None:
+    if duration <= 0:
+        return None
+    if start < -0.05 or end > duration + 0.05:
+        return (
+            f"Klipptiden {start:.2f}–{end:.2f} s ligger utanför videons längd 0–{duration:.2f} s. "
+            "Tiden används inte, och originalvideon läggs inte in i stället."
+        )
+    return None
+
+
+def _overlaps_existing(clips: list[dict], start: float, end: float, slop: float = 0.05) -> str | None:
+    for clip in clips:
+        if start < float(clip["sourceEnd"]) - slop and end > float(clip["sourceStart"]) + slop:
+            return (
+                f"Klippet {start:.2f}–{end:.2f} s överlappar {clip['sourceStart']}–{clip['sourceEnd']} s. "
+                "Välj en tid som inte redan ligger i tidslinjen."
+            )
+    return None
+
+
+def min_readable_seconds(text: str) -> float:
+    """A one-word line such as 'Wow!' has to stay up long enough to be read."""
+    words = [word for word in str(text).split() if any(ch.isalnum() for ch in word)]
+    return max(0.8, 0.28 * max(1, len(words)))
+
+
+def _text_time_error(start: float, end: float, text: str = "") -> str | None:
+    try:
+        start, end = float(start), float(end)
+    except (TypeError, ValueError):
+        return "Textens tid måste vara ett tal."
+    if start < -0.05:
+        return "Texten kan inte börja före 0 sekunder."
+    need = min_readable_seconds(text) if str(text).strip() else 0.8
+    if end - start + 1e-3 < need:
+        shown = str(text).strip() or "text"
+        return (
+            f"Texten \"{shown}\" är bara {end - start:.2f} s och hinner inte läsas. "
+            f"Den behöver minst {need:.1f} s."
+        )
+    return None
+
+
 def _as_seconds(start: float, end: float, duration: float) -> tuple[float, float]:
     """Models often send milliseconds (1000 meaning 1.0s)."""
     start, end = float(start), float(end)
@@ -682,6 +747,8 @@ def compile_plan(plan: dict, analysis: dict | None) -> dict:
             for e in plan["effects"]
         )
 
+    if plan.get("audio", {}).get("decorate") is False:
+        return plan
     for index, row in enumerate(rows):
         if index == 0:
             continue

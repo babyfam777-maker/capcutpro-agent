@@ -78,7 +78,7 @@ def test_loose_tool_call_parser():
 def test_agent_loop_mutates_plan_and_commits(tmp_path: Path):
     source = tmp_path / "in.mp4"
     subprocess.check_call(
-        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
         stdout=subprocess.DEVNULL,
     )
     project = Store(tmp_path / "projects").create("in.mp4", source)
@@ -102,7 +102,7 @@ def test_agent_loop_mutates_plan_and_commits(tmp_path: Path):
 def test_stalled_model_still_commits_a_plan_from_analysis(tmp_path: Path):
     source = tmp_path / "in.mp4"
     subprocess.check_call(
-        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
         stdout=subprocess.DEVNULL,
     )
     project = Store(tmp_path / "projects").create("in.mp4", source)
@@ -128,10 +128,47 @@ def test_stalled_model_still_commits_a_plan_from_analysis(tmp_path: Path):
     assert project.editor.active == 1
 
 
+def test_bigger_text_keeps_lines_even_if_the_model_replaces_them(tmp_path: Path):
+    source = tmp_path / "in.mp4"
+    subprocess.check_call(
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+        stdout=subprocess.DEVNULL,
+    )
+    project = Store(tmp_path / "projects").create("in.mp4", source)
+    project.editor.analysis = ANALYSIS
+    project.editor.select_clip(0.2, 2.0)
+    project.editor.add_caption(0.0, 0.8, "one line")
+    project.editor.add_caption(0.8, 1.6, "two line")
+    project.editor.add_caption(1.6, 2.4, "three line")
+    project.editor.versions.append({"version": 1, "plan": json.loads(json.dumps(project.editor.plan)), "probe": {}})
+    project.editor.active = 1
+    project.editor.dirty = False
+    texts = [cap["text"] for cap in project.editor.plan["captions"]]
+
+    class Wipe(FakeLLM):
+        def create(self, **kwargs):
+            if "tools" not in kwargs:
+                return _Response(_Message("Versionen är klar."))
+            self.step += 1
+            if self.step == 1:
+                return _Response(_Message(tool=("replace_captions", {"captions": [{"start": 0.2, "end": 0.6, "text": "ONLY"}]})))
+            return _Response(_Message(tool=("commit_render", {})))
+
+    def fake_render(current):
+        current.editor.active = 2
+        current.editor.dirty = False
+        return {"ok": True, "version": 2, "probe": {"duration": 1.8, "width": 1080, "height": 1920, "videoCodec": "h264"}}
+
+    run_turn(project, "gör texten större", lambda *_: None, llm=Wipe(), force_render=fake_render)
+    assert [cap["text"] for cap in project.editor.plan["captions"]] == texts
+    assert project.editor.plan["style"]["captionFontSize"] > 72
+    assert len(project.editor.plan["clips"]) == 1
+
+
 def test_undo_message_steps_back_without_a_new_render(tmp_path: Path):
     source = tmp_path / "in.mp4"
     subprocess.check_call(
-        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
         stdout=subprocess.DEVNULL,
     )
     project = Store(tmp_path / "projects").create("in.mp4", source)

@@ -257,17 +257,37 @@ def transcribe(path: Path) -> dict:
     if _whisper is None:
         _whisper = WhisperModel(os_whisper_model(), device="cpu", compute_type="int8")
     audio = _load_audio(path)
-    segments, info = _whisper.transcribe(audio, word_timestamps=True, vad_filter=True, beam_size=1)
-    words, texts = _collect(segments)
-    if not words:
-        # Synthetic or quiet speech is sometimes dropped by the VAD.
-        segments, info = _whisper.transcribe(audio, word_timestamps=True, vad_filter=False, beam_size=1)
-        words, texts = _collect(segments)
+    # temperature as a single 0 keeps the greedy decode. The library default is a
+    # fallback list that starts sampling when the first pass looks weak, and that
+    # sampling invented a transcript ("Menacing … Seattle") for a clip whose
+    # greedy decode is the real speech.
+    words, texts, info = _decode(audio, vad_filter=True)
+    if _timestamps_unusable(words):
+        words, texts, info = _decode(audio, vad_filter=False)
     return {
         "language": getattr(info, "language", None),
         "text": " ".join(texts).strip(),
         "words": words,
     }
+
+
+def _decode(audio: np.ndarray, *, vad_filter: bool):
+    segments, info = _whisper.transcribe(
+        audio,
+        word_timestamps=True,
+        vad_filter=vad_filter,
+        beam_size=1,
+        temperature=0.0,
+    )
+    words, texts = _collect(segments)
+    return words, texts, info
+
+
+def _timestamps_unusable(words: list[dict]) -> bool:
+    """A missing transcript, or one word stretched across several seconds."""
+    if not words:
+        return True
+    return any(float(word["end"]) - float(word["start"]) > 3.0 for word in words)
 
 
 def _collect(segments) -> tuple[list[dict], list[str]]:
