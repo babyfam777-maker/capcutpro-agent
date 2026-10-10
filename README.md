@@ -61,6 +61,7 @@ Workern pratar med vilket program som helst som har samma API som OpenAI. Standa
 | `MODEL` | `qwen2.5:3b` | Modellnamn. En större modell, till exempel `qwen2.5:7b`, följer instruktioner bättre. |
 | `WORKER_URL` | `http://127.0.0.1:8787` | Adressen webbsidan använder till workern |
 | `WHISPER_MODEL` | `base` | Lokal tal-till-text. `small` är noggrannare och tyngre. |
+| `LLM_TIMEOUT` | `180` | Hur många sekunder workern väntar på ett svar från modellen. Höj om en långsam modell hinner inte svara. |
 
 Exempel med en annan server:
 

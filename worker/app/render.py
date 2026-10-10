@@ -66,7 +66,7 @@ def _build_speech(original: Path, analysis: dict, plan: dict, dest: Path) -> Non
     script = dest.with_suffix(".txt")
     script.write_text(";\n".join(parts))
     run(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(original), "-filter_complex_script", str(script),
+        ["ffmpeg", "-y", "-v", "error", "-i", str(original), "-filter_complex", script.read_text(),
          "-map", "[speech]", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(dest)],
         "Ljudklipp",
     )
@@ -92,7 +92,7 @@ def _mix(speech: Path, plan: dict, sfx: dict[str, Path], dest: Path) -> None:
     parts.append(f"[0:a]{''.join(labels)}amix=inputs={1+len(labels)}:duration=first:dropout_transition=0:normalize=0[mix]")
     script = dest.with_suffix(".txt")
     script.write_text(";\n".join(parts))
-    cmd += ["-filter_complex_script", str(script), "-map", "[mix]", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(dest)]
+    cmd += ["-filter_complex", script.read_text(), "-map", "[mix]", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(dest)]
     run(cmd, "Ljudeffekter")
 
 

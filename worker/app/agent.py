@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Callable
 
@@ -105,7 +106,7 @@ TOOLS = [
 
 
 def client() -> OpenAI:
-    kwargs: dict[str, Any] = {"base_url": OPENAI_BASE_URL, "api_key": OPENAI_API_KEY, "timeout": 180}
+    kwargs: dict[str, Any] = {"base_url": OPENAI_BASE_URL, "api_key": OPENAI_API_KEY, "timeout": float(os.environ.get("LLM_TIMEOUT", "180"))}
     return OpenAI(**kwargs)
 
 
