@@ -73,6 +73,32 @@ def test_rejected_speech_still_builds_a_visual_short(monkeypatch):
     assert not any(clip["label"] == "replay" for clip in plan["clips"])
 
 
+def test_speed_rounding_cannot_make_a_phrase_unreadable(monkeypatch):
+    monkeypatch.setattr("app.mvp._ask_model", lambda prompt, fallback: None)
+    doc = _analysis()
+    doc["phrases"].append({
+        "id": "ph_3",
+        "text": "You're going to love it",
+        "t0": 5.92,
+        "t1": 6.94,
+        "status": "SUPPORTED",
+        "wordEvidenceIds": ["ev_y"],
+    })
+    doc["transcript"].append({
+        "id": "tr_4",
+        "status": "SUPPORTED",
+        "text": "You're going to love it",
+        "t0": 5.92,
+        "t1": 6.94,
+        "phraseIds": ["ph_3"],
+    })
+    board = build_storyboard(doc, "make a short")
+    plan = plan_from_storyboard(board, doc)
+    story = next(effect for effect in plan["effects"] if effect.get("text") == "You're going to love it")
+    need = min_readable_seconds(story["text"])
+    assert not (story["end"] - story["start"] + 1e-3 < need)
+
+
 def test_qa_flags_a_rejected_line(tmp_path, monkeypatch):
     monkeypatch.setattr("app.mvp._ask_model", lambda prompt, fallback: None)
     # QA on a missing file is not the point: check the text gate through the plan builder.

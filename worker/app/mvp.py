@@ -6,6 +6,7 @@ This module does not change the v1 edit path. It calls render_plan as it stands.
 from __future__ import annotations
 
 import json
+import math
 import re
 import urllib.request
 from pathlib import Path
@@ -106,17 +107,16 @@ def build_storyboard(analysis: dict, prompt: str) -> dict:
             continue
         kept_phrases.append(phrase)
         span = _clamp_span(float(phrase["t0"]), float(phrase["t1"]), duration, limit=4.0)
-        if span[1] - span[0] < 0.2:
+        source_start = round(span[0], 3)
+        source_end = round(span[1], 3)
+        source_span = round(source_end - source_start, 3)
+        if source_span < 0.2:
             continue
-        need = min_readable_seconds(phrase["text"])
-        speed = 1.12
-        if span[1] - span[0] < need * speed:
-            speed = max(0.7, (span[1] - span[0]) / need)
         story.append({
             "role": "STORY",
-            "sourceStart": round(span[0], 3),
-            "sourceEnd": round(span[1], 3),
-            "speed": round(speed, 3),
+            "sourceStart": source_start,
+            "sourceEnd": source_end,
+            "speed": _readable_speed(source_span, min_readable_seconds(phrase["text"])),
             "zoomStart": 1.0,
             "zoomEnd": 1.06,
             "why": f"Hel fras {phrase['id']}.",
@@ -661,6 +661,24 @@ def _overlaps(phrase: dict, events: list[dict]) -> bool:
 
 def _close(a: tuple[float, float], b: tuple[float, float]) -> bool:
     return a[0] < b[1] - 0.15 and a[1] > b[0] + 0.15
+
+
+def _readable_speed(source_span: float, need: float) -> float:
+    """Speed that keeps a caption readable after it is stored to 3 decimals.
+
+    Rounding 0.72857 up to 0.729 turned a 1.40s line into 1.399s, and the
+    readable check then failed by a fraction of a millisecond. Aim past the
+    minimum and floor the speed so the clip only gets longer.
+    """
+    target = need + 0.12
+    if source_span <= 0:
+        return 1.0
+    speed = 1.12
+    if source_span < target * speed:
+        speed = source_span / target
+    speed = min(1.12, max(0.5, speed))
+    floored = math.floor(speed * 1000 + 1e-9) / 1000
+    return round(min(1.12, max(0.5, floored)), 3)
 
 
 def _clamp_span(t0: float, t1: float, duration: float, minimum: float = 0.25, limit: float = 3.2) -> tuple[float, float]:
