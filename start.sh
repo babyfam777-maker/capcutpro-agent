@@ -29,7 +29,16 @@ fi
 
 if [[ ! -d worker/.venv ]]; then
   echo "Installerar worker-paket (första gången)…"
-  python3 -m venv worker/.venv
+  PY=$(command -v python3.12 || command -v python3.11 || command -v python3)
+  py_mm=$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+  py_major=${py_mm%%.*}
+  py_minor=${py_mm#*.}
+  if (( py_major > 3 || (py_major == 3 && py_minor >= 13) )); then
+    echo "Python ${py_mm} kan inte installera numpy (ingen färdig wheel för 3.13+). Installera Python 3.12."
+    echo "Mac: brew install python@3.12"
+    exit 1
+  fi
+  "$PY" -m venv worker/.venv
   worker/.venv/bin/pip install -U pip
   worker/.venv/bin/pip install -r worker/requirements.txt
 fi
@@ -70,9 +79,13 @@ fi
 
 if [[ ! -d node_modules ]]; then
   echo "Installerar webbsidan (första gången)…"
-  corepack enable
-  corepack prepare pnpm@10.18.0 --activate
-  pnpm install --frozen-lockfile
+  if command -v pnpm >/dev/null 2>&1; then
+    pnpm install --frozen-lockfile
+  elif command -v corepack >/dev/null 2>&1; then
+    corepack enable && corepack prepare pnpm@10.18.0 --activate && pnpm install --frozen-lockfile
+  else
+    npx -y pnpm@10.18.0 install --frozen-lockfile
+  fi
 fi
 
 cleanup() {

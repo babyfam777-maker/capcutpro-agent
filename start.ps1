@@ -16,7 +16,22 @@ foreach ($cmd in @("ffmpeg", "ffprobe", "python", "node")) {
 
 if (-not (Test-Path "worker\.venv")) {
   Write-Host "Installerar worker-paket (första gången)..."
-  python -m venv worker\.venv
+  $py = $null
+  foreach ($name in @("python3.12", "python3.11", "python3", "python")) {
+    $cmd = Get-Command $name -ErrorAction SilentlyContinue
+    if ($cmd) { $py = $cmd.Source; break }
+  }
+  if (-not $py) {
+    Write-Host "Python 3 saknas. Installera Python 3.12."
+    exit 1
+  }
+  $pyMm = & $py -c "import sys; print('%d.%d' % sys.version_info[:2])"
+  $pyParts = $pyMm.Split(".")
+  if ([int]$pyParts[0] -gt 3 -or ([int]$pyParts[0] -eq 3 -and [int]$pyParts[1] -ge 13)) {
+    Write-Host "Python $pyMm kan inte installera numpy (ingen färdig wheel för 3.13+). Installera Python 3.12."
+    exit 1
+  }
+  & $py -m venv worker\.venv
   & worker\.venv\Scripts\python -m pip install -U pip
   & worker\.venv\Scripts\pip install -r worker\requirements.txt
 }
@@ -53,9 +68,15 @@ if ($env:OPENAI_BASE_URL -match "127.0.0.1:11434" -or $env:OPENAI_BASE_URL -matc
 }
 
 if (-not (Test-Path node_modules)) {
-  corepack enable
-  corepack prepare pnpm@10.18.0 --activate
-  pnpm install --frozen-lockfile
+  if (Get-Command pnpm -ErrorAction SilentlyContinue) {
+    pnpm install --frozen-lockfile
+  } elseif (Get-Command corepack -ErrorAction SilentlyContinue) {
+    corepack enable
+    corepack prepare pnpm@10.18.0 --activate
+    pnpm install --frozen-lockfile
+  } else {
+    npx -y pnpm@10.18.0 install --frozen-lockfile
+  }
 }
 
 Write-Host "Startar workern..."
