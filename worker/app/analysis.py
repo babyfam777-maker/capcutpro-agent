@@ -251,6 +251,20 @@ def _load_audio(path: Path) -> np.ndarray:
 
 
 def transcribe(path: Path) -> dict:
+    detailed = transcribe_detailed(path)
+    return {
+        "language": detailed["language"],
+        "text": detailed["text"],
+        "words": detailed["words"],
+    }
+
+
+def transcribe_detailed(path: Path) -> dict:
+    """Same decode as transcribe(), plus segment scores for the v2 transcript gate.
+
+    The word list and text match transcribe(). Callers that only need those fields
+    should keep using transcribe().
+    """
     global _whisper
     from faster_whisper import WhisperModel
 
@@ -261,13 +275,15 @@ def transcribe(path: Path) -> dict:
     # fallback list that starts sampling when the first pass looks weak, and that
     # sampling invented a transcript ("Menacing … Seattle") for a clip whose
     # greedy decode is the real speech.
-    words, texts, info = _decode(audio, vad_filter=True)
+    words, texts, segments, info = _decode(audio, vad_filter=True)
     if _timestamps_unusable(words):
-        words, texts, info = _decode(audio, vad_filter=False)
+        words, texts, segments, info = _decode(audio, vad_filter=False)
     return {
         "language": getattr(info, "language", None),
+        "languageProbability": getattr(info, "language_probability", None),
         "text": " ".join(texts).strip(),
         "words": words,
+        "segments": segments,
     }
 
 
@@ -279,8 +295,8 @@ def _decode(audio: np.ndarray, *, vad_filter: bool):
         beam_size=1,
         temperature=0.0,
     )
-    words, texts = _collect(segments)
-    return words, texts, info
+    words, texts, detailed = _collect(segments)
+    return words, texts, detailed, info
 
 
 def _timestamps_unusable(words: list[dict]) -> bool:
@@ -290,27 +306,43 @@ def _timestamps_unusable(words: list[dict]) -> bool:
     return any(float(word["end"]) - float(word["start"]) > 3.0 for word in words)
 
 
-def _collect(segments) -> tuple[list[dict], list[str]]:
+def _collect(segments) -> tuple[list[dict], list[str], list[dict]]:
     words = []
     texts = []
+    detailed = []
     for segment in segments:
         text = (segment.text or "").strip()
-        low = text.lower()
-        if any(h in low for h in _HALLUCINATIONS) and (segment.no_speech_prob or 0) > 0.4:
-            continue
-        texts.append(text)
         if segment.words:
+            seg_words = []
             for word in segment.words:
                 token = (word.word or "").strip()
                 if token:
-                    words.append({
+                    seg_words.append({
                         "text": token,
                         "start": round(float(word.start), 3),
                         "end": round(float(word.end), 3),
                     })
         elif text:
-            words.extend(_spread(text, float(segment.start), float(segment.end)))
-    return words, texts
+            seg_words = _spread(text, float(segment.start), float(segment.end))
+        else:
+            seg_words = []
+        no_speech = float(segment.no_speech_prob or 0)
+        blocked = any(hint in text.lower() for hint in _HALLUCINATIONS) and no_speech > 0.4
+        detailed.append({
+            "text": text,
+            "t0": round(float(segment.start), 3),
+            "t1": round(float(segment.end), 3),
+            "avgLogprob": round(float(segment.avg_logprob or 0), 3),
+            "noSpeechProb": round(no_speech, 3),
+            "compressionRatio": round(float(segment.compression_ratio or 0), 3),
+            "hallucination": blocked,
+            "words": [dict(word) for word in seg_words],
+        })
+        if blocked or not text:
+            continue
+        texts.append(text)
+        words.extend(seg_words)
+    return words, texts, detailed
 
 
 def os_whisper_model() -> str:

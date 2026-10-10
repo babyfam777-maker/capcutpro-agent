@@ -3,11 +3,17 @@
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from app.analysis_v2 import (
+    UnusableTranscriptError,
     build_video_analysis,
     drop_mouth_open_during_speech,
+    gate_transcript,
     music_evidence_from_bins,
+    phrases_for_editplan,
     segment_phrases,
+    supported_words,
     validate_video_analysis,
 )
 from app.store import Store
@@ -49,6 +55,134 @@ def test_a_repeated_token_loop_is_dropped_and_not_glued_into_phrases():
 
     short = [_word("ok,", i * 0.1) for i in range(5)]
     assert [word["text"] for word in _drop_token_loops(short, [])] == ["ok,"] * 5
+
+
+def test_a_short_sentence_stays_whole_across_a_scene_cut():
+    words = [
+        _word("to", 0.00, 0.20),
+        _word("love", 0.20, 0.40),
+        _word("it", 0.40, 0.60),
+        _word("You", 0.60, 0.90),
+        _word("look", 0.90, 1.20),
+        _word("beautiful", 1.20, 1.80),
+        _word("You", 1.80, 2.10),
+        _word("look", 2.10, 2.30),
+        _word("beautiful", 2.30, 2.60),
+        _word("for", 2.60, 2.80),
+        _word("all", 2.80, 3.00),
+        _word("crying", 3.00, 3.40),
+    ]
+    phrases = segment_phrases(words, scene_times=[1.40])
+    texts = [" ".join(word["text"] for word in phrase) for phrase in phrases]
+    assert "You look beautiful" in texts
+    assert "You look" not in texts
+    assert "beautiful for" not in texts
+    whole = next(phrase for phrase in phrases if [word["text"] for word in phrase] == ["You", "look", "beautiful"])
+    assert whole[0]["t0"] == 0.60
+    assert whole[-1]["t1"] == 1.80
+    assert whole[0]["t0"] < 1.40 < whole[-1]["t1"]
+
+
+def _segment(text: str, words: list[dict], **extra) -> dict:
+    row = {
+        "text": text,
+        "t0": words[0]["t0"],
+        "t1": words[-1]["t1"],
+        "avgLogprob": -0.4,
+        "noSpeechProb": 0.1,
+        "compressionRatio": 1.1,
+        "words": [{"text": word["text"], "t0": word["t0"], "t1": word["t1"]} for word in words],
+    }
+    row.update(extra)
+    return row
+
+
+def _speech_profile(**extra) -> dict:
+    profile = {"speech": 0.9, "nonspeech": 0.04, "name": "laughter"}
+    profile.update(extra)
+    return profile
+
+
+def test_music_laughter_and_foreign_text_are_not_usable_speech():
+    music = gate_transcript(
+        [_segment("we stop", [_word("we", 0.2, 0.5), _word("stop", 0.5, 0.9)])],
+        language="en",
+        language_probability=0.9,
+        profiles=[{"speech": 0.04, "nonspeech": 0.93, "name": "music"}],
+    )
+    assert music[0]["status"] == "REJECTED"
+    assert any("music" in reason for reason in music[0]["reasons"])
+    assert supported_words(music) == []
+
+    laughter = gate_transcript(
+        [_segment("ha ha", [_word("ha", 1.0, 1.2), _word("ha", 1.2, 1.4)])],
+        language="en",
+        language_probability=0.8,
+        profiles=[{"speech": 0.2, "nonspeech": 0.7, "name": "laughter"}],
+    )
+    assert laughter[0]["status"] == "REJECTED"
+    assert supported_words(laughter) == []
+
+    foreign = gate_transcript(
+        [_segment("안녕하세요", [_word("안녕하세요", 0.0, 0.4)])],
+        language="ko",
+        language_probability=0.8,
+        profiles=[_speech_profile()],
+    )
+    assert foreign[0]["status"] == "REJECTED"
+    assert supported_words(foreign) == []
+
+    unsure = gate_transcript(
+        [_segment("lindwa green", [_word("lindwa", 5.0, 5.4), _word("green", 5.4, 5.8)], avgLogprob=-1.4)],
+        language="de",
+        language_probability=0.18,
+        profiles=[_speech_profile()],
+    )
+    assert unsure[0]["status"] == "REJECTED"
+    assert supported_words(unsure) == []
+
+
+def test_supported_english_can_be_planned_and_rejected_text_cannot():
+    words = [_word("You", 0.6, 0.9), _word("look", 0.9, 1.2), _word("beautiful", 1.2, 1.8)]
+    rows = gate_transcript(
+        [_segment("You look beautiful", words)],
+        language="en",
+        language_probability=0.97,
+        profiles=[_speech_profile(name="crowd", nonspeech=0.02)],
+    )
+    assert rows[0]["status"] == "SUPPORTED"
+    assert [word["text"] for word in supported_words(rows)] == ["You", "look", "beautiful"]
+    phrase = {
+        "id": "ph_1",
+        "status": "SUPPORTED",
+        "text": "You look beautiful",
+        "t0": 0.6,
+        "t1": 1.8,
+        "wordEvidenceIds": ["ev_1"],
+    }
+    rows[0]["phraseIds"] = ["ph_1"]
+    assert phrases_for_editplan({"phrases": [phrase], "transcript": rows}, ["ph_1"])[0]["text"] == "You look beautiful"
+
+    blocked = {
+        "phrases": [{"id": "ph_9", "status": "REJECTED", "text": "lindwa"}],
+        "transcript": [{"id": "tr_9", "status": "REJECTED", "text": "lindwa", "phraseIds": ["ph_9"]}],
+    }
+    with pytest.raises(UnusableTranscriptError):
+        phrases_for_editplan(blocked, ["ph_9"])
+    with pytest.raises(UnusableTranscriptError):
+        phrases_for_editplan(blocked, ["tr_9"])
+
+
+def test_a_repeated_segment_is_rejected():
+    one = _segment("going to go", [_word("going", 0.0, 0.2), _word("to", 0.2, 0.3), _word("go", 0.3, 0.5)])
+    rows = gate_transcript(
+        [one, dict(one, t0=0.6, t1=1.1), dict(one, t0=1.2, t1=1.7)],
+        language="en",
+        language_probability=0.9,
+        profiles=[_speech_profile(), _speech_profile(), _speech_profile()],
+    )
+    assert [row["status"] for row in rows] == ["REJECTED", "REJECTED", "REJECTED"]
+    assert supported_words(rows) == []
 
 
 def test_long_run_splits_at_six_words_without_reusing_them():
@@ -134,25 +268,37 @@ def test_missing_libraries_add_no_invented_events(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("app.analysis_v2._import_mediapipe", lambda: None)
     monkeypatch.setattr("app.analysis_v2._import_onnxruntime", lambda: None)
     monkeypatch.setattr(
-        "app.analysis_v2.transcribe",
-        lambda path: {"words": [
-            {"text": "look", "start": 0.1, "end": 0.3},
-            {"text": "at", "start": 0.3, "end": 0.5},
-            {"text": "that.", "start": 0.5, "end": 0.8},
-            {"text": "hello", "start": 1.5, "end": 1.8},
-        ]},
+        "app.analysis_v2.transcribe_detailed",
+        lambda path: {
+            "language": "en",
+            "languageProbability": 0.9,
+            "text": "look at that. hello",
+            "words": [],
+            "segments": [{
+                "text": "look at that. hello",
+                "t0": 0.1,
+                "t1": 1.8,
+                "avgLogprob": -0.4,
+                "noSpeechProb": 0.1,
+                "compressionRatio": 1.1,
+                "words": [
+                    {"text": "look", "start": 0.1, "end": 0.3},
+                    {"text": "at", "start": 0.3, "end": 0.5},
+                    {"text": "that.", "start": 0.5, "end": 0.8},
+                    {"text": "hello", "start": 1.5, "end": 1.8},
+                ],
+            }],
+        },
     )
     doc = build_video_analysis(source)
     types = {event["type"] for event in doc["evidence"]}
-    assert types.isdisjoint({"smile", "mouth_open", "point", "hand_to_mouth", "held_object", "laughter", "applause", "scream", "music"})
+    assert types.isdisjoint({"smile", "mouth_open", "point", "hand_to_mouth", "held_object", "laughter", "applause", "scream", "music", "speech_word", "speech_phrase"})
     steps = {item["step"] for item in doc["unavailable"]}
     assert "mediapipe_face" in steps
     assert "mediapipe_hand" in steps
     assert "yamnet" in steps
-    assert _phrase_texts([
-        {"text": event["payload"]["text"], "t0": event["t0"], "t1": event["t1"]}
-        for event in doc["evidence"] if event["type"] == "speech_word"
-    ]) == ["look at that.", "hello"]
+    assert doc["phrases"] == []
+    assert doc["transcript"][0]["status"] == "UNCERTAIN"
     assert validate_video_analysis(doc) == []
     assert doc["source"]["duration"] > 2
 
