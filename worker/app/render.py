@@ -11,13 +11,14 @@ from PIL import Image
 
 from . import gfx
 from .config import FPS, OUT_H, OUT_W
+from .export_spec import EXPORT_SPEC
 from .ffmpeg_util import probe, run
 from .plan_ops import timeline
 from .sfx import ensure_sfx
 
-SAFE_TOP = 220
-SAFE_BOTTOM = 320
-SAFE_SIDE = 60
+SAFE_TOP = int(EXPORT_SPEC["safe_top"])
+SAFE_BOTTOM = int(EXPORT_SPEC["safe_bottom"])
+SAFE_SIDE = int(EXPORT_SPEC["safe_side"])
 
 
 def render_plan(original: Path, analysis: dict, plan: dict, out_path: Path, on_progress=None) -> dict:
@@ -130,7 +131,7 @@ def _encode(original: Path, analysis: dict, plan: dict, audio: Path, out_path: P
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{OUT_W}x{OUT_H}", "-r", str(FPS), "-i", "pipe:0",
         "-i", str(audio),
         "-vf", "unsharp=5:5:0.28:5:5:0.0",
-        "-c:v", "libx264", "-profile:v", "high", "-preset", "veryfast", "-crf", "18",
+        "-c:v", "libx264", "-profile:v", "high", "-preset", "veryfast", "-crf", str(EXPORT_SPEC["crf"]),
         "-pix_fmt", "yuv420p", "-r", str(FPS),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart",
@@ -336,6 +337,9 @@ def _caption_sprite(caption: dict, cache: dict):
 
 
 def _anchor(effect: dict, sprite: Image.Image, faces: list[dict]) -> tuple[int, int]:
+    # Optional lane. Plans that omit it keep the historical headline/badge positions.
+    if effect.get("preferY") is not None:
+        return _avoid(sprite, faces, prefer_y=int(effect["preferY"]))
     face = _match_face(effect.get("track"), faces)
     anchor = effect.get("anchor") or "above"
     if effect["type"] == "text" and effect.get("kind") == "headline":

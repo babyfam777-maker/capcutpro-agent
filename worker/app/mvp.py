@@ -8,18 +8,30 @@ from __future__ import annotations
 import json
 import math
 import re
-import urllib.request
 from pathlib import Path
 
 from .analysis_v2 import phrases_for_editplan
-from .config import MODEL, OPENAI_API_KEY, OPENAI_BASE_URL
+from .captions import (
+    allowed_hooks,
+    classify_phrase,
+    complete_json,
+    kept_review_lines,
+    overlay_messages,
+    parse_json_object,
+    retry_note,
+    same_caption,
+    sanity_messages,
+    split_overlay,
+    validate_overlay,
+)
+from .export_spec import EXPORT_SPEC, duration_requirement, moov_before_mdat
 from .ffmpeg_util import probe, run
 from .plan_ops import empty_plan, min_readable_seconds, timeline
 from .render import render_plan
 from .safety import lint_emoji, lint_text
 
 _FILLER = {"um", "uh", "hmm", "ah", "er", "but", "like", "so", "yeah", "ok", "okay"}
-_HOOK_FALLBACK = "LOOK"
+_HOOK_FALLBACK = "WATCH"
 
 
 def produce_short(video: Path, analysis: dict, prompt: str, out_path: Path) -> dict:
@@ -66,14 +78,52 @@ def build_storyboard(analysis: dict, prompt: str) -> dict:
     motions = _events(analysis, "motion")
     cuts = [float(t) for t in analysis.get("scenes") or []]
 
-    hook_phrase = _best_phrase(phrases, smiles, cuts)
+    story = []
+    kept_phrases: list[dict] = []
+    review_phrases: list[dict] = []
+    dropped: list[dict] = []
+    for phrase in phrases:
+        if _is_filler(phrase["text"]):
+            dropped.append(_drop(phrase, "fyllnadsord"))
+            continue
+        kind, reason = classify_phrase(phrase, analysis)
+        if kind == "drop":
+            dropped.append(_drop(phrase, reason))
+            continue
+        if _extends_another(phrase, kept_phrases + review_phrases):
+            dropped.append(_drop(phrase, "förlänger en tidigare fras"))
+            continue
+        if any(same_caption(phrase["text"], other["text"]) for other in kept_phrases + review_phrases):
+            dropped.append(_drop(phrase, "upprepning"))
+            continue
+        if kind == "review":
+            review_phrases.append(phrase)
+            continue
+        kept_phrases.append(phrase)
+        story.append(_phrase_beat(phrase, duration))
+    fields = _fields(
+        prompt,
+        _best_phrase(kept_phrases, smiles, cuts),
+        bool(smiles or laughs),
+        bool(kept_phrases or review_phrases),
+        dropped,
+        review_phrases,
+    )
+    rescued = []
+    for phrase in review_phrases:
+        if any(same_caption(phrase["text"], line) for line in fields.get("keep_lines") or []):
+            rescued.append(phrase)
+            story.append(_phrase_beat(phrase, duration))
+        else:
+            dropped.append(_drop(phrase, "osäker signal och modellen behöll den inte"))
+    kept_phrases.extend(rescued)
+    hook_phrase = _best_phrase(kept_phrases, smiles, cuts)
     if hook_phrase:
-        hook_span = (float(hook_phrase["t0"]), float(hook_phrase["t1"]))
+        hook_span = _clamp_span(float(hook_phrase["t0"]), float(hook_phrase["t1"]), duration)
         hook_why = f"Fras {hook_phrase['id']} är det starkaste stödda ögonblicket."
     else:
         hook_span, hook_why = _visual_hook(duration, cuts, motions, smiles, laughs)
-    hook_span = _clamp_span(*hook_span, duration)
-
+        hook_span = _clamp_span(*hook_span, duration)
     beats = [{
         "role": "HOOK",
         "sourceStart": round(hook_span[0], 3),
@@ -97,34 +147,8 @@ def build_storyboard(analysis: dict, prompt: str) -> dict:
                 "why": "Kort tillbakaspolning mot början efter öppningen.",
                 "phraseId": None,
             })
-
-    story = []
-    kept_phrases: list[dict] = []
-    for phrase in phrases:
-        if _is_filler(phrase["text"]):
-            continue
-        if _extends_another(phrase, kept_phrases):
-            continue
-        kept_phrases.append(phrase)
-        span = _clamp_span(float(phrase["t0"]), float(phrase["t1"]), duration, limit=4.0)
-        source_start = round(span[0], 3)
-        source_end = round(span[1], 3)
-        source_span = round(source_end - source_start, 3)
-        if source_span < 0.2:
-            continue
-        story.append({
-            "role": "STORY",
-            "sourceStart": source_start,
-            "sourceEnd": source_end,
-            "speed": _readable_speed(source_span, min_readable_seconds(phrase["text"])),
-            "zoomStart": 1.0,
-            "zoomEnd": 1.06,
-            "why": f"Hel fras {phrase['id']}.",
-            "phraseId": phrase["id"],
-            "text": phrase["text"],
-            "status": "SUPPORTED",
-        })
-    if not story:
+    story = [beat for beat in story if beat.get("sourceEnd", 0) > beat.get("sourceStart", 0)]
+    if not any(beat.get("text") for beat in story):
         for span, why in _visual_beats(duration, hook_span, cuts, motions, smiles):
             story.append({
                 "role": "STORY",
@@ -136,12 +160,13 @@ def build_storyboard(analysis: dict, prompt: str) -> dict:
                 "why": why,
                 "phraseId": None,
             })
-    beats.extend(story)
-
+    story.extend(_gap_beats(duration, story))
+    story.sort(key=lambda beat: (beat["sourceStart"], beat["sourceEnd"]))
     smile = _strongest(smiles)
+    replay = []
     if smile and float(smile["t1"]) - float(smile["t0"]) >= 0.35:
         span = _clamp_span(float(smile["t0"]), min(float(smile["t1"]), float(smile["t0"]) + 1.1), duration)
-        beats.append({
+        replay.append({
             "role": "REPLAY",
             "sourceStart": round(span[0], 3),
             "sourceEnd": round(span[1], 3),
@@ -153,13 +178,16 @@ def build_storyboard(analysis: dict, prompt: str) -> dict:
             "trackId": smile.get("trackId"),
             "evidenceId": smile["id"],
         })
-
-    fields = _fields(prompt, hook_phrase, bool(smile or laughs), bool(phrases))
+    beats.extend(story)
+    beats.extend(replay)
+    policy = _fit_duration(beats, duration)
     return {
         "prompt": prompt,
         "beats": beats,
         "fields": fields,
         "blockedTexts": sorted(blocked),
+        "droppedPhrases": dropped,
+        "durationPolicy": policy,
         "limitations": list(analysis.get("limitations") or []),
     }
 
@@ -170,6 +198,11 @@ def plan_from_storyboard(board: dict, analysis: dict) -> dict:
     plan["audio"]["music"] = False
     plan["audio"]["decorate"] = False
     plan["title"] = board["fields"]["hook"][:70]
+    plan["captionSource"] = {
+        "source": board["fields"].get("caption_source") or "fallback",
+        "reason": board["fields"].get("caption_reason") or "",
+    }
+    plan["durationPolicy"] = dict(board.get("durationPolicy") or {})
     clips = []
     for index, beat in enumerate(board["beats"], start=1):
         focus = beat.get("trackId") or _face_during(analysis, beat["sourceStart"], beat["sourceEnd"])
@@ -201,9 +234,11 @@ def plan_from_storyboard(board: dict, analysis: dict) -> dict:
 
     hook_row = next((row for row in rows if row["label"] == "hook"), None)
     fields = board["fields"]
+    headline = str(fields.get("displayHook") or fields["hook"])
+    badge = str(fields.get("badge") or "")
     if hook_row:
         hook_end = min(float(hook_row["outEnd"]), float(hook_row["outStart"]) + 1.25)
-        hook_end = max(hook_end, float(hook_row["outStart"]) + min_readable_seconds(fields["hook"]))
+        hook_end = max(hook_end, float(hook_row["outStart"]) + min_readable_seconds(headline))
         hook_end = min(hook_end, float(hook_row["outEnd"]))
         if hook_end - float(hook_row["outStart"]) >= 0.8:
             add_effect({
@@ -211,16 +246,23 @@ def plan_from_storyboard(board: dict, analysis: dict) -> dict:
                 "kind": "headline",
                 "start": 0.0,
                 "end": round(hook_end, 3),
-                "text": fields["hook"],
-                "accent": fields["accent"],
+                "text": headline,
+                "accent": "" if badge else fields.get("accent") or "",
                 "fontSize": 120,
+                "preferY": int(EXPORT_SPEC["safe_top"]) + 40,
+                "caption_source": fields.get("caption_source") or "fallback",
+                "caption_reason": fields.get("caption_reason") or "",
             })
-            add_effect({
-                "type": "badge",
-                "start": 0.0,
-                "end": round(hook_end, 3),
-                "text": fields["accent"],
-            })
+            if badge and badge.upper() not in headline.upper().split():
+                add_effect({
+                    "type": "badge",
+                    "start": 0.0,
+                    "end": round(hook_end, 3),
+                    "text": badge,
+                    "preferY": int(EXPORT_SPEC["height"]) - int(EXPORT_SPEC["safe_bottom"]) - 180,
+                    "caption_source": fields.get("caption_source") or "fallback",
+                    "caption_reason": fields.get("caption_reason") or "",
+                })
         add_effect({"type": "sound_effect", "sfx": "impact", "time": 0.02, "gainDb": -8})
 
     rewind = next((row for row in rows if row["label"] == "rewind"), None)
@@ -248,12 +290,16 @@ def plan_from_storyboard(board: dict, analysis: dict) -> dict:
             "text": text,
             "accent": "",
             "fontSize": 64,
+            "caption_source": "phrase",
+            "caption_reason": "Stödd fras som klarade rimlighetskontrollen.",
         })
         captions.append({
             "text": text,
             "start": round(start, 3),
             "end": round(end, 3),
             "source": "phrase",
+            "caption_source": "phrase",
+            "caption_reason": "Stödd fras som klarade rimlighetskontrollen.",
             "status": "SUPPORTED",
             "phraseId": beat.get("phraseId"),
         })
@@ -274,6 +320,9 @@ def plan_from_storyboard(board: dict, analysis: dict) -> dict:
                 "text": fields["bubble"],
                 "accent": "",
                 "fontSize": 48,
+                "preferY": 980,
+                "caption_source": fields.get("caption_source") or "fallback",
+                "caption_reason": fields.get("caption_reason") or "",
             })
 
     replay = next((row for row in rows if row["label"] == "replay"), None)
@@ -332,15 +381,22 @@ def qa_output(path: Path, plan: dict, analysis: dict) -> dict:
     def check(name: str, ok: bool, detail: str) -> None:
         checks.append({"name": name, "ok": bool(ok), "detail": detail})
 
-    check("duration", duration > 0.8, f"{duration:.3f}s")
-    check("resolution", int(video.get("width") or 0) == 1080 and int(video.get("height") or 0) == 1920, f"{video.get('width')}x{video.get('height')}")
-    check("codec", video.get("codec_name") == "h264" and audio.get("codec_name") == "aac", f"{video.get('codec_name')}/{audio.get('codec_name')}")
-    check("fps", abs(fps - 30) < 0.2, rate)
+    source_duration = float((analysis.get("source") or {}).get("duration") or 0)
+    duration_ok, duration_detail = duration_requirement(duration, plan.get("durationPolicy"), source_duration)
+    check("duration", duration_ok, duration_detail)
+    size_ok = int(video.get("width") or 0) == int(EXPORT_SPEC["width"]) and int(video.get("height") or 0) == int(EXPORT_SPEC["height"])
+    pix_ok = str(video.get("pix_fmt") or "") == EXPORT_SPEC["pix_fmt"]
+    check("resolution", size_ok and pix_ok, f"{video.get('width')}x{video.get('height')} {video.get('pix_fmt')}")
+    fast = moov_before_mdat(path) if EXPORT_SPEC["faststart"] else True
+    codec_ok = video.get("codec_name") == EXPORT_SPEC["video_codec"] and audio.get("codec_name") == EXPORT_SPEC["audio_codec"] and fast
+    check("codec", codec_ok, f"{video.get('codec_name')}/{audio.get('codec_name')} faststart={fast}")
+    check("fps", abs(fps - float(EXPORT_SPEC["fps"])) < float(EXPORT_SPEC["fps_tolerance"]), rate)
     check("audio", bool(audio), "ljudspår finns" if audio else "ljudspår saknas")
     loud = _mean_volume(path)
-    check("not_silent", loud is not None and loud > -45, f"mean {loud} dB" if loud is not None else "okänd")
+    check("not_silent", loud is not None and loud > float(EXPORT_SPEC["silence_mean_db"]), f"mean {loud} dB" if loud is not None else "okänd")
     lufs = _integrated_lufs(path)
-    check("lufs", lufs is not None and abs(lufs + 14) <= 1.6, f"{lufs} LUFS" if lufs is not None else "okänd")
+    lufs_ok = lufs is not None and abs(lufs - float(EXPORT_SPEC["lufs"])) <= float(EXPORT_SPEC["lufs_tolerance"])
+    check("lufs", lufs_ok, f"{lufs} LUFS" if lufs is not None else "okänd")
     check("original_audio", plan.get("audio", {}).get("keepOriginal") is True and plan.get("audio", {}).get("music") is False, "keepOriginal, ingen musik")
     blocked = _blocked_texts(analysis)
     texts = _plan_texts(plan)
@@ -353,9 +409,25 @@ def qa_output(path: Path, plan: dict, analysis: dict) -> dict:
             late.append(item["text"])
         if item["end"] - item["start"] + 1e-3 < min_readable_seconds(item["text"]):
             short.append(item["text"])
+    floor_y = int(EXPORT_SPEC["safe_top"])
+    limit_y = int(EXPORT_SPEC["height"]) - int(EXPORT_SPEC["safe_bottom"])
+    for effect in plan.get("effects") or []:
+        if effect.get("preferY") is None:
+            continue
+        lane = int(effect["preferY"])
+        if lane < floor_y or lane >= limit_y:
+            short.append(str(effect.get("text") or effect.get("type")))
     check("text_inside_duration", not late, ", ".join(late) or "inom längden")
     check("readable", not short, ", ".join(short) or "läsbara tider")
-    return {"ok": all(item["ok"] for item in checks), "checks": checks, "duration": round(duration, 3), "lufs": lufs}
+    return {
+        "ok": all(item["ok"] for item in checks),
+        "checks": checks,
+        "duration": round(duration, 3),
+        "lufs": lufs,
+        "captionSource": plan.get("captionSource") or {},
+        "durationPolicy": plan.get("durationPolicy") or {},
+        "spec": {"min_duration": EXPORT_SPEC["min_duration"], "lufs": EXPORT_SPEC["lufs"], "size": f"{EXPORT_SPEC['width']}x{EXPORT_SPEC['height']}"},
+    }
 
 
 def _usable_phrases(analysis: dict, blocked: set[str]) -> list[dict]:
@@ -468,13 +540,39 @@ def _visual_beats(duration, hook_span, cuts, motions, smiles):
     return chosen
 
 
-def _fields(prompt: str, phrase: dict | None, reaction: bool, has_speech: bool) -> dict:
+def _fields(prompt: str, phrase: dict | None, reaction: bool, has_speech: bool, dropped: list[dict] | None = None, review: list[dict] | None = None) -> dict:
+    hooks = allowed_hooks(phrase)
     hook, accent = _hook_from_phrase(phrase) if phrase else (_HOOK_FALLBACK, _HOOK_FALLBACK)
+    if hook not in hooks:
+        hook = hooks[0]
+        accent = hook.split()[-1]
     emoji = "😳" if reaction else ""
     bubble = "" if has_speech else "wait"
-    fallback = {"hook": hook, "accent": accent, "emoji": emoji, "bubble": bubble, "llm": False}
+    fallback = {
+        "hook": hook,
+        "accent": accent,
+        "emoji": emoji,
+        "bubble": bubble,
+        "llm": False,
+        "allowedHooks": hooks,
+        "hasSpeech": has_speech,
+        "reaction": reaction,
+        "droppedLines": [item["text"] for item in (dropped or []) if item.get("text")],
+        "reviewLines": [item["text"] for item in (review or []) if item.get("text")],
+    }
     if lint_text(hook) or lint_text(accent) or (emoji and lint_emoji(emoji)) or (bubble and lint_text(bubble)):
-        fallback = {"hook": _HOOK_FALLBACK, "accent": _HOOK_FALLBACK, "emoji": "", "bubble": "", "llm": False}
+        fallback = {
+            "hook": _HOOK_FALLBACK,
+            "accent": _HOOK_FALLBACK,
+            "emoji": "",
+            "bubble": "",
+            "llm": False,
+            "allowedHooks": [_HOOK_FALLBACK],
+            "hasSpeech": has_speech,
+            "reaction": False,
+            "droppedLines": fallback["droppedLines"],
+            "reviewLines": fallback["reviewLines"],
+        }
     choice = _ask_model(prompt, fallback)
     return _accept_fields(choice, fallback, reaction, has_speech)
 
@@ -498,56 +596,110 @@ def _hook_from_phrase(phrase: dict) -> tuple[str, str]:
 
 
 def _ask_model(prompt: str, fallback: dict) -> dict | None:
-    body = {
-        "model": MODEL,
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Return one JSON object. Keys: hook, accent, emoji, bubble. "
-                    "hook must equal the fallback hook. accent must equal the fallback accent. "
-                    "emoji must be the fallback emoji or an empty string. "
-                    "bubble must be the fallback bubble or an empty string. No other words."
-                ),
-            },
-            {"role": "user", "content": json.dumps({"prompt": prompt[:240], "fallback": fallback}, ensure_ascii=False)},
-        ],
-    }
-    request = urllib.request.Request(
-        OPENAI_BASE_URL + "/chat/completions",
-        data=json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=12) as response:
-            payload = json.loads(response.read().decode())
-        content = payload["choices"][0]["message"]["content"]
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        return json.loads(match.group(0) if match else content)
-    except Exception:
-        return None
+    """Ask qwen for a constrained overlay. Tests replace this whole function."""
+    del prompt
+    allowed = list(fallback.get("allowedHooks") or [fallback["hook"]])
+    speech = bool(fallback.get("hasSpeech"))
+    reaction = bool(fallback.get("reaction"))
+    messages = overlay_messages(allowed, speech=speech, reaction=reaction)
+    raw: list[str] = []
+    parsed = None
+    problem = "model unavailable"
+    for _ in range(3):
+        try:
+            text = complete_json(messages)
+        except Exception as exc:
+            raw.append(f"error: {exc}")
+            problem = "model request failed"
+            continue
+        raw.append(text[:500])
+        parsed = parse_json_object(text)
+        problem = validate_overlay(parsed, allowed, speech=speech, reaction=reaction) or ""
+        if not problem and parsed is not None:
+            break
+        messages.append({"role": "assistant", "content": text[:800]})
+        messages.append({"role": "user", "content": retry_note(problem or "not JSON", allowed, speech=speech)})
+    keep_lines: list[str] = []
+    sanity_raw = ""
+    review = list(fallback.get("reviewLines") or [])
+    dropped = list(fallback.get("droppedLines") or [])
+    if review or dropped:
+        try:
+            sanity_raw = complete_json(sanity_messages(dropped, review))[:800]
+            keep_lines = kept_review_lines(parse_json_object(sanity_raw), review)
+        except Exception as exc:
+            sanity_raw = f"error: {exc}"
+    if problem or parsed is None:
+        return {
+            "invalid": True,
+            "caption_reason": problem or "model reply was not constrained JSON",
+            "model_raw": raw,
+            "sanity_raw": sanity_raw,
+            "keep_lines": keep_lines,
+        }
+    parsed["caption_source"] = "model"
+    parsed["caption_reason"] = "validated"
+    parsed["model_raw"] = raw
+    parsed["sanity_raw"] = sanity_raw
+    parsed["keep_lines"] = keep_lines
+    parsed["llm"] = True
+    return parsed
 
 
 def _accept_fields(choice: dict | None, fallback: dict, reaction: bool, has_speech: bool) -> dict:
-    fields = dict(fallback)
+    allowed = list(fallback.get("allowedHooks") or [fallback["hook"]])
+    speech = bool(fallback.get("hasSpeech", has_speech))
+    base = {
+        "hook": fallback["hook"],
+        "accent": fallback["accent"],
+        "emoji": fallback.get("emoji") or "",
+        "bubble": "" if has_speech else (fallback.get("bubble") or ""),
+        "llm": False,
+        "caption_source": "fallback",
+        "caption_reason": "model unavailable",
+        "model_raw": [],
+        "sanity_raw": "",
+        "keep_lines": [],
+    }
     if not isinstance(choice, dict):
-        return fields
-    hook = str(choice.get("hook") or "").strip().upper()
-    accent = str(choice.get("accent") or "").strip().upper()
-    # A reply that does not repeat the chosen hook is not a constrained answer.
-    # qwen2.5:3b often echoes the user JSON, and missing keys must not wipe the fallback.
-    if hook != fallback["hook"] or accent != fallback["accent"] or lint_text(hook):
-        return fields
-    fields["llm"] = True
+        return _present_fields(base)
+    base["model_raw"] = list(choice.get("model_raw") or [])
+    base["sanity_raw"] = str(choice.get("sanity_raw") or "")
+    base["keep_lines"] = list(choice.get("keep_lines") or [])
+    if choice.get("invalid") or validate_overlay(choice, allowed, speech=speech, reaction=reaction):
+        base["caption_reason"] = str(choice.get("caption_reason") or "model reply was not constrained JSON")
+        return _present_fields(base)
+    if lint_text(str(choice.get("hook") or "")) or lint_text(str(choice.get("accent") or "")):
+        base["caption_reason"] = "model text failed the safety lint"
+        return _present_fields(base)
     emoji = str(choice.get("emoji") or "").strip()
-    if reaction and emoji in ("😳", "😅", "‼️", "🫣") and not lint_emoji(emoji):
-        fields["emoji"] = emoji
-    bubble = str(choice.get("bubble") or "").strip().lower()
-    if not has_speech and bubble == "wait" and not lint_text(bubble):
-        fields["bubble"] = bubble
-    if has_speech:
-        fields["bubble"] = ""
+    if emoji and lint_emoji(emoji):
+        base["caption_reason"] = "model emoji failed the safety lint"
+        return _present_fields(base)
+    reason = str(choice.get("caption_reason") or "validated")
+    if reaction and not emoji:
+        emoji = str(fallback.get("emoji") or "")
+        if emoji:
+            reason = reason + "; reaction emoji kept"
+    bubble = "" if has_speech else str(choice.get("bubble") or "").strip().lower()
+    return _present_fields({
+        "hook": str(choice["hook"]).strip().upper(),
+        "accent": str(choice["accent"]).strip().upper(),
+        "emoji": emoji if reaction else "",
+        "bubble": bubble,
+        "llm": True,
+        "caption_source": "model",
+        "caption_reason": reason,
+        "model_raw": base["model_raw"],
+        "sanity_raw": base["sanity_raw"],
+        "keep_lines": base["keep_lines"],
+    })
+
+
+def _present_fields(fields: dict) -> dict:
+    display, badge = split_overlay(fields["hook"], fields["accent"])
+    fields["displayHook"] = display or fields["hook"]
+    fields["badge"] = badge
     return fields
 
 
@@ -658,6 +810,135 @@ def _overlaps(phrase: dict, events: list[dict]) -> bool:
 
 def _close(a: tuple[float, float], b: tuple[float, float]) -> bool:
     return a[0] < b[1] - 0.15 and a[1] > b[0] + 0.15
+
+
+def _drop(phrase: dict, reason: str) -> dict:
+    return {"id": phrase.get("id"), "text": phrase.get("text"), "t0": phrase.get("t0"), "t1": phrase.get("t1"), "reason": reason}
+
+
+def _phrase_beat(phrase: dict, duration: float) -> dict:
+    span = _clamp_span(float(phrase["t0"]), float(phrase["t1"]), duration, limit=4.0)
+    source_start = round(span[0], 3)
+    source_end = round(span[1], 3)
+    source_span = round(source_end - source_start, 3)
+    return {
+        "role": "STORY",
+        "sourceStart": source_start,
+        "sourceEnd": source_end,
+        "speed": _readable_speed(max(source_span, 0.2), min_readable_seconds(phrase["text"])),
+        "zoomStart": 1.0,
+        "zoomEnd": 1.06,
+        "why": f"Hel fras {phrase['id']}.",
+        "phraseId": phrase["id"],
+        "text": phrase["text"],
+        "status": "SUPPORTED",
+    }
+
+
+def _gap_beats(duration: float, story: list[dict]) -> list[dict]:
+    spans = sorted((float(beat["sourceStart"]), float(beat["sourceEnd"])) for beat in story)
+    merged: list[list[float]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1] + 0.05:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    gaps: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in merged:
+        if start - cursor >= 0.8:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if duration - cursor >= 0.8:
+        gaps.append((cursor, duration))
+    beats = []
+    for start, end in gaps:
+        moment = start
+        while end - moment >= 0.8:
+            nxt = min(end, moment + 2.6)
+            if end - nxt < 0.8:
+                nxt = end
+            beats.append({
+                "role": "STORY",
+                "sourceStart": round(moment, 3),
+                "sourceEnd": round(nxt, 3),
+                "speed": 1.0,
+                "zoomStart": 1.0,
+                "zoomEnd": 1.04,
+                "why": "Bild som täcker en lucka mellan stödda fraser.",
+                "phraseId": None,
+            })
+            moment = nxt
+    return beats
+
+
+def _beats_duration(beats: list[dict]) -> float:
+    total = 0.0
+    for beat in beats:
+        if float(beat["speed"]) <= 0.001:
+            total += float(beat.get("holdSec") or 0.11)
+        else:
+            span = max(0.0, float(beat["sourceEnd"]) - float(beat["sourceStart"]))
+            total += span / float(beat["speed"])
+    return total
+
+
+def _ceiling(beats: list[dict], source_duration: float) -> float:
+    hook = next(beat for beat in beats if beat["role"] == "HOOK")
+    hook_len = max(0.0, float(hook["sourceEnd"]) - float(hook["sourceStart"]))
+    rewinds = sum(float(beat.get("holdSec") or 0.11) for beat in beats if beat["role"] == "REWIND")
+    slow = float(EXPORT_SPEC["min_speed"])
+    return source_duration / slow + hook_len / slow + rewinds
+
+
+def _fit_duration(beats: list[dict], source_duration: float) -> dict:
+    """Slow supported picture until the timeline clears the export minimum."""
+    minimum = float(EXPORT_SPEC["min_duration"])
+    target = minimum + float(EXPORT_SPEC["duration_margin"])
+    ceiling = _ceiling(beats, source_duration)
+    aim = target if ceiling >= minimum else max(0.0, ceiling)
+    for _ in range(24):
+        current = _beats_duration(beats)
+        if current >= aim - 0.02:
+            break
+        movable = [beat for beat in beats if float(beat["speed"]) > 0.505]
+        if not movable:
+            break
+        factor = max(float(EXPORT_SPEC["min_speed"]), current / aim)
+        progressed = False
+        for beat in movable:
+            updated = round(max(float(EXPORT_SPEC["min_speed"]), float(beat["speed"]) * factor), 3)
+            if updated < float(beat["speed"]) - 0.0005:
+                beat["speed"] = updated
+                progressed = True
+        if progressed:
+            continue
+        longest = max(movable, key=lambda beat: (float(beat["sourceEnd"]) - float(beat["sourceStart"])) / float(beat["speed"]))
+        stepped = round(float(longest["speed"]) - 0.01, 3)
+        if stepped >= float(EXPORT_SPEC["min_speed"]) and stepped < float(longest["speed"]):
+            longest["speed"] = stepped
+        else:
+            break
+    current = _beats_duration(beats)
+    exception = None
+    reason = ""
+    if current + 0.05 < minimum:
+        if ceiling + 0.05 < minimum:
+            exception = "source_shorter_than_minimum"
+            reason = (
+                f"Källan är {source_duration:.2f}s. Hela bilden i {EXPORT_SPEC['min_speed']}× "
+                f"plus öppningen blir {ceiling:.2f}s och når inte {minimum:.0f}s."
+            )
+        else:
+            reason = "Tidslinjen nådde inte minimilängden trots att källan räcker."
+    return {
+        "minimum": minimum,
+        "timeline": round(current, 3),
+        "ceiling": round(ceiling, 3),
+        "floor": round(current, 3),
+        "exception": exception,
+        "reason": reason,
+    }
 
 
 def _readable_speed(source_span: float, need: float) -> float:
