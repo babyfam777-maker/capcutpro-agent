@@ -60,11 +60,6 @@ if (-not (Test-Path node_modules)) {
 
 Write-Host "Startar workern..."
 $worker = Start-Process -FilePath "worker\.venv\Scripts\uvicorn.exe" -ArgumentList "app.main:app","--app-dir","worker","--host","127.0.0.1","--port","8787" -PassThru -WindowStyle Hidden
-Write-Host "Öppna http://127.0.0.1:3000"
-Write-Host "Stäng det här fönstret för att stoppa webbsidan. Workern har process-id $($worker.Id)."
-$env:CAPCUT_SKIP_EVE = "1"
-if (Get-Command pnpm -ErrorAction SilentlyContinue) {
-  pnpm run dev
-} else {
-  npm run dev
-}
+Write-Host "Startar webbsidan. http://127.0.0.1:3000 skrivs ut först när den svarar."
+Write-Host "Workern har process-id $($worker.Id)."
+node scripts/dev-server.mjs

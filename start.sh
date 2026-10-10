@@ -90,18 +90,19 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   sleep 0.4
 done
 
-echo ""
-echo "Öppna http://127.0.0.1:3000"
-echo "Stäng med Ctrl+C."
-echo ""
-# Bind is fixed in package.json (127.0.0.1). On macOS, `next dev` without a
-# hostname listens on IPv6 only, and Safari then cannot open 127.0.0.1.
-export CAPCUT_SKIP_EVE=1
-if command -v pnpm >/dev/null 2>&1; then
-  pnpm run dev
-elif command -v npm >/dev/null 2>&1; then
-  npm run dev
-else
-  echo "Varken pnpm eller npm finns. Installera Node från https://nodejs.org"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # A project unzipped into ~/Downloads is quarantined. macOS then lets the
+  # process start but blocks Safari from connecting to it.
+  xattr -dr com.apple.quarantine "$PWD" 2>/dev/null || true
+fi
+
+if [[ ! -f node_modules/next/dist/bin/next ]]; then
+  echo "Next.js saknas i node_modules."
   exit 1
 fi
+
+echo ""
+echo "Startar webbsidan. http://127.0.0.1:3000 skrivs ut först när den svarar."
+echo "Stäng med Ctrl+C."
+echo ""
+node scripts/dev-server.mjs

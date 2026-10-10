@@ -4,12 +4,16 @@ import { withEve } from "eve/next";
 const nextConfig: NextConfig = {
   // Skip repeating codegen-time typechecking on every deployment build.
   typescript: { ignoreBuildErrors: true },
+  // Safari loads the page from 127.0.0.1. Dev assets must allow that host.
+  allowedDevOrigins: ["127.0.0.1", "localhost"],
 };
 
-// The home editor talks to the local worker and does not need the eve dev
-// server. That server requires Node 24, so `npm run dev` on Node 22 skips it.
-// On Node 24, eve still wraps the app unless CAPCUT_SKIP_EVE=1.
+// Next.js itself requires Node >= 20.9. Eve's own dev server requires Node >= 24
+// and exits the whole `next dev` process on Node 22, which leaves port 3000 closed.
+// The local editor does not use that server. Set EVE_DEV=1 only when Node is 24.
 const nodeMajor = Number(process.versions.node.split(".")[0]) || 0;
-const skipEve = process.env.CAPCUT_SKIP_EVE === "1" || nodeMajor < 24;
+if (process.env.EVE_DEV === "1" && nodeMajor < 24) {
+  throw new Error("EVE_DEV=1 kräver Node 24. Starta utan EVE_DEV för den lokala editorn.");
+}
 
-export default skipEve ? nextConfig : withEve(nextConfig);
+export default process.env.EVE_DEV === "1" ? withEve(nextConfig) : nextConfig;
