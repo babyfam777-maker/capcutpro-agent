@@ -63,4 +63,8 @@ $worker = Start-Process -FilePath "worker\.venv\Scripts\uvicorn.exe" -ArgumentLi
 Write-Host "Öppna http://127.0.0.1:3000"
 Write-Host "Stäng det här fönstret för att stoppa webbsidan. Workern har process-id $($worker.Id)."
 $env:CAPCUT_SKIP_EVE = "1"
-pnpm dev --hostname 127.0.0.1 --port 3000
+if (Get-Command pnpm -ErrorAction SilentlyContinue) {
+  pnpm run dev
+} else {
+  npm run dev
+}

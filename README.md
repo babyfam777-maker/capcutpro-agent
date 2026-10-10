@@ -19,7 +19,7 @@ Vercel kan visa webbsidan, men kan inte köra FFmpeg, Whisper eller en lokal mod
 bash start.sh
 ```
 
-4. Öppna [http://127.0.0.1:3000](http://127.0.0.1:3000).
+4. Öppna [http://127.0.0.1:3000](http://127.0.0.1:3000). Använd just den adressen. På Mac lyssnar servern på 127.0.0.1, så att Safari kan öppna sidan.
 5. Välj en video. Skriv till exempel: `Gör den här till en viral Short`.
 6. Vänta tills spelaren visar v1. Skriv sedan en ändring, till exempel `gör texten större`. Det blir v2 av samma plan, inte en ny film från noll.
 7. Knappen **Ångra** (eller ordet `ångra` i chatten) går tillbaka till förra versionen.

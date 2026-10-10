@@ -94,4 +94,14 @@ echo ""
 echo "Öppna http://127.0.0.1:3000"
 echo "Stäng med Ctrl+C."
 echo ""
-WORKER_URL="$WORKER_URL" CAPCUT_SKIP_EVE=1 pnpm dev --hostname 127.0.0.1 --port 3000
+# Bind is fixed in package.json (127.0.0.1). On macOS, `next dev` without a
+# hostname listens on IPv6 only, and Safari then cannot open 127.0.0.1.
+export CAPCUT_SKIP_EVE=1
+if command -v pnpm >/dev/null 2>&1; then
+  pnpm run dev
+elif command -v npm >/dev/null 2>&1; then
+  npm run dev
+else
+  echo "Varken pnpm eller npm finns. Installera Node från https://nodejs.org"
+  exit 1
+fi
