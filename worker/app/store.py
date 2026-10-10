@@ -41,6 +41,7 @@ class Project:
         self.messages = _read(folder / "messages.json") or []
         analysis = _read(folder / "analysis.json")
         plan = _read(folder / "plan.json")
+        self.render_view = _read(folder / "render_view.json")
         self.editor = Editor(analysis, plan)
         self.editor.active = self.state.get("activeVersion")
         self.editor.dirty = bool(self.state.get("dirty"))
@@ -173,7 +174,7 @@ class Project:
             "replaced": bool(prepared.get("note")),
         }
 
-    def analyze_v2(self) -> dict:
+    def analyze_v2(self, on_step=None) -> dict:
         """Write analysis_v2.json. Does not read or write analysis.json."""
         path = self.folder / "analysis_v2.json"
         cached = _read(path)
@@ -183,11 +184,57 @@ class Project:
         from .analysis_v2 import build_video_analysis
 
         try:
-            document = build_video_analysis(self.original, sha256=digest)
+            kwargs = {"sha256": digest}
+            if on_step:
+                kwargs["on_step"] = on_step
+            document = build_video_analysis(self.original, **kwargs)
         except Exception as error:
             return {"ok": False, "error": str(error)}
         _write(path, document)
         return {"ok": True, "cached": False, "analysis": document}
+
+    def set_render_view(self, view: dict) -> None:
+        self.render_view = view
+        _write(self.folder / "render_view.json", view)
+
+    def next_version_folder(self) -> tuple[int, Path]:
+        version = max([item["version"] for item in self.editor.versions], default=0) + 1
+        folder = self.folder / "versions" / f"v{version}"
+        folder.mkdir(parents=True, exist_ok=True)
+        return version, folder
+
+    def save_version(self, version: int, plan: dict, probe: dict, qa: dict | None = None) -> dict:
+        """Store a rendered MP4. Does not rebuild the plan through the v1 auto-editor."""
+        before = self.original_hash
+        after = hashlib.sha256(self.original.read_bytes()).hexdigest()
+        if before and before != after:
+            raise RuntimeError("Originalfilen ändrades under render. Det ska inte kunna hända.")
+        folder = self.folder / "versions" / f"v{version}"
+        if not (folder / "output.mp4").exists():
+            raise RuntimeError("Renderfilen saknas.")
+        _write(folder / "plan.json", plan)
+        _write(folder / "probe.json", probe)
+        if qa is not None:
+            _write(folder / "qa.json", qa)
+        self.editor.plan = copy.deepcopy(plan)
+        self.editor.dirty = False
+        self.editor.undo_stack.clear()
+        self.editor.active = version
+        self.editor.versions.append({
+            "version": version,
+            "plan": copy.deepcopy(plan),
+            "probe": probe,
+            "qa": qa,
+            "output": str(folder / "output.mp4"),
+        })
+        self.save()
+        return {
+            "ok": True,
+            "version": version,
+            "videoUrl": f"/projects/{self.id}/versions/{version}/video",
+            "probe": probe,
+            "qa": qa,
+        }
 
 
 class Store:

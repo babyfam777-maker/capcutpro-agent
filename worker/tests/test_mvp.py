@@ -112,6 +112,17 @@ def test_echoed_model_reply_keeps_the_reaction_emoji(monkeypatch):
     assert any(effect.get("type") == "emoji" and effect.get("emoji") == "😳" for effect in plan["effects"])
 
 
+def test_story_prompt_can_pull_the_hook_to_a_matching_phrase(monkeypatch):
+    monkeypatch.setattr("app.mvp._ask_model", lambda prompt, fallback: None)
+    doc = _analysis()
+    doc["phrases"][0]["text"] = "hello there friend"
+    doc["transcript"][0]["text"] = "hello there friend"
+    board = build_storyboard(doc, "focus on the friend")
+    hook = next(beat for beat in board["beats"] if beat["role"] == "HOOK")
+    assert hook["phraseId"] == "ph_1"
+    assert hook["sourceStart"] < 2.5
+
+
 def test_qa_flags_a_rejected_line(tmp_path, monkeypatch):
     monkeypatch.setattr("app.mvp._ask_model", lambda prompt, fallback: None)
     # QA on a missing file is not the point: check the text gate through the plan builder.

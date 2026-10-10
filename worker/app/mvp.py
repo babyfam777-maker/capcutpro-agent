@@ -66,7 +66,7 @@ def build_storyboard(analysis: dict, prompt: str) -> dict:
     motions = _events(analysis, "motion")
     cuts = [float(t) for t in analysis.get("scenes") or []]
 
-    hook_phrase = _best_phrase(phrases, smiles, cuts)
+    hook_phrase = _best_phrase(phrases, smiles, cuts, prompt)
     if hook_phrase:
         hook_span = (float(hook_phrase["t0"]), float(hook_phrase["t1"]))
         hook_why = f"Fras {hook_phrase['id']} är det starkaste stödda ögonblicket."
@@ -400,7 +400,7 @@ def _events(analysis: dict, kind: str) -> list[dict]:
     return [event for event in analysis.get("evidence") or [] if event.get("type") == kind]
 
 
-def _best_phrase(phrases: list[dict], smiles: list[dict], cuts: list[float]) -> dict | None:
+def _best_phrase(phrases: list[dict], smiles: list[dict], cuts: list[float], prompt: str = "") -> dict | None:
     best = None
     best_score = -1.0
     for phrase in phrases:
@@ -413,11 +413,34 @@ def _best_phrase(phrases: list[dict], smiles: list[dict], cuts: list[float]) -> 
             score += 0.6
         if float(phrase["t0"]) > 0.8:
             score += 0.4
+        score += _prompt_bonus(prompt, phrase)
         if _extends_another(phrase, phrases):
             score -= 3.0
         if score > best_score:
             best, best_score = phrase, score
     return best
+
+
+_PROMPT_STOP = {
+    "make", "short", "this", "that", "with", "from", "about", "focus", "video", "clip",
+    "gora", "kort", "handlar", "nagon", "någon", "vill", "ska", "inte", "bara",
+    "the", "and", "for", "med", "som", "att", "den", "det", "har", "hon", "han",
+}
+
+
+def _prompt_bonus(prompt: str, phrase: dict) -> float:
+    """A story prompt can pull the opening toward a supported phrase that shares its words."""
+    folded = _fold_prompt(prompt)
+    words = [word for word in re.findall(r"[a-z0-9']+", folded) if len(word) >= 4 and word not in _PROMPT_STOP]
+    if not words:
+        return 0.0
+    text = _fold_prompt(str(phrase.get("text") or ""))
+    hits = sum(1 for word in words if word in text)
+    return 3.0 * hits
+
+
+def _fold_prompt(text: str) -> str:
+    return str(text).lower().translate(str.maketrans("åäöéü", "aaoeu"))
 
 
 def _visual_hook(duration, cuts, motions, smiles, laughs):

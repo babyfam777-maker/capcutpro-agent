@@ -12,6 +12,8 @@ async function proxy(request: NextRequest, path: string[]): Promise<Response> {
   const headers = new Headers();
   const contentType = request.headers.get("content-type");
   if (contentType) headers.set("content-type", contentType);
+  const range = request.headers.get("range");
+  if (range) headers.set("range", range);
   if (process.env.WORKER_TOKEN) headers.set("x-worker-token", process.env.WORKER_TOKEN);
 
   const init: RequestInit & { duplex?: "half" } = {
@@ -34,7 +36,7 @@ async function proxy(request: NextRequest, path: string[]): Promise<Response> {
   }
 
   const out = new Headers();
-  for (const name of ["content-type", "content-disposition", "content-length", "cache-control"]) {
+  for (const name of ["content-type", "content-disposition", "content-length", "cache-control", "accept-ranges", "content-range"]) {
     const value = response.headers.get(name);
     if (value) out.set(name, value);
   }

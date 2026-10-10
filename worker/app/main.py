@@ -5,13 +5,14 @@ import tempfile
 import threading
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from .agent import run_turn
 from .config import MODEL, OPENAI_BASE_URL, WORKER_TOKEN
 from .ffmpeg_util import run
+from .shorts import render_again, render_first_short
 from .store import Project, store
 
 app = FastAPI(title="CapCutPro worker")
@@ -59,6 +60,24 @@ def create_project(file: UploadFile = File(...)):
 @app.get("/projects/{project_id}")
 def get_project(project_id: str):
     return _project(project_id).public()
+
+
+@app.post("/projects/{project_id}/short")
+def post_short(project_id: str, body: dict):
+    project = _project(project_id)
+    prompt = str(body.get("prompt") or body.get("text") or "")
+    return _sse(project, lambda on_event: render_first_short(project, prompt, on_event))
+
+
+@app.post("/projects/{project_id}/rerender")
+def post_rerender(project_id: str, body: dict):
+    project = _project(project_id)
+    lines = body.get("lines")
+    if isinstance(lines, str):
+        lines = [lines]
+    if not isinstance(lines, list):
+        lines = [str(body.get("text") or "")]
+    return _sse(project, lambda on_event: render_again(project, [str(line) for line in lines], on_event))
 
 
 @app.post("/projects/{project_id}/messages")
@@ -114,12 +133,18 @@ def original(project_id: str):
 
 
 @app.get("/projects/{project_id}/versions/{version}/video")
-def version_video(project_id: str, version: int):
+def version_video(project_id: str, version: int, download: int = Query(0)):
     project = _project(project_id)
     path = project.folder / "versions" / f"v{version}" / "output.mp4"
     if not path.exists():
         raise HTTPException(404, "Den versionen finns inte.")
-    return FileResponse(path, media_type="video/mp4", filename=f"v{version}.mp4")
+    # Inline so mobile Safari can play the file. download=1 sets a real attachment.
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=f"capcutpro-v{version}.mp4",
+        content_disposition_type="attachment" if download else "inline",
+    )
 
 
 @app.get("/projects/{project_id}/versions/{version}/plan")
@@ -129,6 +154,39 @@ def version_plan(project_id: str, version: int):
     if not found:
         raise HTTPException(404, "Den versionen finns inte.")
     return {"version": version, "plan": found["plan"], "probe": found.get("probe")}
+
+
+def _sse(project: Project, work):
+    if project.busy:
+        return JSONResponse({"error": "En redigering pågår redan för den här videon."}, status_code=409)
+    project.busy = True
+    events: queue.Queue = queue.Queue()
+
+    def runner():
+        try:
+            work(lambda event, data: events.put((event, data)))
+        except Exception as error:
+            events.put(("error", {"message": str(error)}))
+        finally:
+            project.busy = False
+            project.save()
+            events.put(None)
+
+    threading.Thread(target=runner, daemon=True).start()
+
+    def stream():
+        while True:
+            item = events.get()
+            if item is None:
+                break
+            event, data = item
+            yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def _project(project_id: str) -> Project:

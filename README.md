@@ -78,6 +78,21 @@ bash start.sh
 2. Öppna bara port 8787 mot din egen dator, inte mot hela internet. Workern har inget lösenord om du inte sätter `WORKER_TOKEN`.
 3. På webbsidan sätter du `WORKER_URL` till serverns adress, och samma `WORKER_TOKEN` om du använder en.
 
+## GÖR MIN SHORT
+
+Startsidan heter CAPCUTPRO / VIRAL SHORT EDITOR. Släpp vilken video som helst, skriv vad shortsen ska handla om och tryck **GÖR MIN SHORT**. Workern kör analys v2 och den befintliga `render_plan`. Chatten ändrar planen, inte en ny renderer:
+
+| Du skriver | Planen |
+|---|---|
+| Gör hooken större | Större hook-text och röd ruta |
+| Ta bort pilen | Pileffekten tas bort |
+| Mer zoom på personen | Högre zoom på ansiktsspåret |
+| Gör texten roligare | Story-raderna och bubblan skrivs om |
+
+**RENDER IGEN** bygger nästa MP4 (v2, v3, …) från den ändrade planen. Spelaren visar filen på sidan. **Ladda ner MP4** hämtar samma fil.
+
+Vercel kan visa sidan men inte köra FFmpeg. För en preview sätter du `NEXT_PUBLIC_WORKER_URL` till en https-adress där den här workern kör (`WORKER_HOST=0.0.0.0`). Utan den adressen pratar sidan med `/api/worker` på samma dator, vilket `start.sh` startar.
+
 ## Vad som händer
 
 AI:n ser inte filmfilen. Den anropar verktyg som ändrar en plan (JSON). Renderaren läser planen och bygger mp4-filen. Verktygen är: `analyze_video`, `get_transcript`, `get_scenes`, `get_faces`, `select_clip`, `trim_clip`, `delete_timeline_range`, `reorder_clips`, `change_speed`, `set_zoom`, `set_focus`, `add_caption`, `replace_captions`, `add_text`, `add_emoji`, `add_arrow`, `add_circle`, `add_badge`, `add_sound_effect`, `remove_effect`, `undo`, `commit_render`.
