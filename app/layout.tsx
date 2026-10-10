@@ -20,14 +20,14 @@ const mono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "capcutpro",
-  description: "A Next.js starter for eve agents with AI Elements.",
+  title: "CapCutPro",
+  description: "Ladda upp en video, skriv vad du vill, få en YouTube Short.",
 };
 
 // The page and Eve routes validate the generated app's Better Auth session.
 export default function RootLayout({ children }: { readonly children: ReactNode }) {
   return (
-    <html className={cn(sans.variable, mono.variable)} lang="en">
+    <html className={cn(sans.variable, mono.variable)} lang="sv">
       <body>
         <TooltipProvider>{children}</TooltipProvider>
       </body>

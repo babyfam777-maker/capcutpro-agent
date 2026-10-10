@@ -6,4 +6,8 @@ const nextConfig: NextConfig = {
   typescript: { ignoreBuildErrors: true },
 };
 
-export default withEve(nextConfig);
+// The home editor talks to the local worker and does not need the eve dev
+// server (which requires Node 24). Leave this unset for `eve dev` / Vercel.
+const skipEve = process.env.CAPCUT_SKIP_EVE === "1";
+
+export default skipEve ? nextConfig : withEve(nextConfig);
