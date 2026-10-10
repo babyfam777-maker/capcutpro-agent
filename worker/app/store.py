@@ -173,6 +173,22 @@ class Project:
             "replaced": bool(prepared.get("note")),
         }
 
+    def analyze_v2(self) -> dict:
+        """Write analysis_v2.json. Does not read or write analysis.json."""
+        path = self.folder / "analysis_v2.json"
+        cached = _read(path)
+        digest = self.original_hash or hashlib.sha256(self.original.read_bytes()).hexdigest()
+        if cached and cached.get("version") == 2 and (cached.get("source") or {}).get("sha256") == digest:
+            return {"ok": True, "cached": True, "analysis": cached}
+        from .analysis_v2 import build_video_analysis
+
+        try:
+            document = build_video_analysis(self.original, sha256=digest)
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
+        _write(path, document)
+        return {"ok": True, "cached": False, "analysis": document}
+
 
 class Store:
     def __init__(self, root: Path | None = None):
