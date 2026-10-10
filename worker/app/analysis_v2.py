@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .analysis import _load_audio, detect_scenes, transcribe
+from .analysis import _load_audio, detect_scenes, transcribe_detailed
 from .ffmpeg_util import video_meta
 
 log = logging.getLogger(__name__)
@@ -42,6 +42,29 @@ EVIDENCE_TYPES = {
 TRACK_KINDS = {"person", "face", "hand", "object"}
 PHRASE_GAP_S = 0.45
 PHRASE_MAX_WORDS = 6
+LOGPROB_REJECT = -1.0
+COMPRESSION_REJECT = 2.4
+NO_SPEECH_REJECT = 0.6
+LANG_PROB_REJECT = 0.5
+SPEECH_SUPPORT_MIN = 0.35
+_NONSPEECH = (
+    ("music", 132),
+    ("singing", 24),
+    ("laughter", 13),
+    ("applause", 62),
+    ("scream", 11),
+    ("cheering", 61),
+    ("crowd", 64),
+    ("chatter", 63),
+    ("hubbub", 65),
+)
+# Face and hand boxes are evidence, not identities. These limits are documented
+# here so a later storyboard does not treat a miss as a fact.
+FACE_HAND_LIMITATIONS = [
+    "Ansikten i mörker, i profil och på avstånd missas ofta. Tröskeln anpassas inte efter ett enstaka klipp.",
+    "Handspår hamnar ofta på armar och överkropp. Grepp betyder bara en knuten hand, inte ett namngivet föremål. Pekning är en heuristik.",
+    "Ett leende är inte skratt. Skratt, applåd och skrik kommer bara från ljudklassningen.",
+]
 SMILE_MIN = 0.45
 SMILE_MIN_S = 0.20
 JAW_MIN = 0.40
@@ -94,17 +117,53 @@ def build_video_analysis(path: Path, sha256: str | None = None) -> dict:
     motion_series, motion_evidence = timed("motion", lambda: _motion(path, meta, unavailable))
     face_tracks, face_events = timed("faces", lambda: _faces(path, meta, unavailable))
     hand_tracks, hand_events = timed("hands", lambda: _hands(path, meta, face_tracks, unavailable))
-    words = timed("whisper", lambda: _words(path, bool(meta.get("hasAudio")), unavailable))
-    words.sort(key=lambda word: (float(word["t0"]), float(word["t1"])))
-    phrases = segment_phrases(words)
+    raw = timed("whisper", lambda: _read_transcript(path, bool(meta.get("hasAudio")), unavailable))
+    prepared: dict = {}
+
+    def _prepare_audio() -> None:
+        if not meta.get("hasAudio"):
+            prepared["audio"] = None
+            prepared["scores"] = None
+            prepared["hop"] = 0.48
+            return
+        audio = _load_audio(path)
+        scores = _yamnet_scores(audio, unavailable)
+        hop = 0.48
+        if scores is not None and len(scores) and len(audio):
+            hop = max(0.05, (len(audio) / 16000) / len(scores))
+        prepared["audio"] = audio
+        prepared["scores"] = scores
+        prepared["hop"] = hop
+
+    timed("audio", _prepare_audio)
+    profiles: list[dict | None] | None
+    if prepared["scores"] is None:
+        profiles = [None] * len(raw["segments"])
+    else:
+        profiles = [
+            _audio_profile(prepared["scores"], prepared["hop"], float(segment.get("t0") or 0), float(segment.get("t1") or 0))
+            for segment in raw["segments"]
+        ]
+    transcript = gate_transcript(
+        raw["segments"],
+        language=raw.get("language"),
+        language_probability=raw.get("languageProbability"),
+        profiles=profiles,
+    )
+    words = supported_words(transcript)
+    phrases = segment_phrases(words, scene_times=scenes)
     mouth = drop_mouth_open_during_speech(
         [event for event in face_events if event["type"] == "mouth_open"],
         phrases,
     )
     face_events = [event for event in face_events if event["type"] != "mouth_open"] + mouth
-    bins, audio_events = timed(
-        "audio",
-        lambda: _audio(path, duration, bool(meta.get("hasAudio")), words, unavailable),
+    bins, audio_events = _audio(
+        path,
+        duration,
+        bool(meta.get("hasAudio")),
+        words,
+        unavailable,
+        prepared=prepared,
     )
 
     ids = _Ids()
@@ -128,41 +187,47 @@ def build_video_analysis(path: Path, sha256: str | None = None) -> dict:
         })
     for event in motion_evidence + face_events + hand_events + audio_events:
         take(event)
-    word_ids = []
     for word in words:
-        item = {
+        take({
             "type": "speech_word",
             "t0": word["t0"],
             "t1": word["t1"],
             "trackId": None,
-            "confidence": 0.6,
+            "confidence": float(word.get("confidence") or 0.6),
             "source": "whisper",
             "payload": {"text": word["text"]},
-        }
-        take(item)
-        word_ids.append(evidence[-1]["id"])
+        })
         word["id"] = evidence[-1]["id"]
     phrase_docs = []
     for index, phrase in enumerate(phrases, start=1):
         ids_for_phrase = [word["id"] for word in phrase]
         text = " ".join(word["text"] for word in phrase)
+        phrase_id = f"ph_{index}"
+        transcript_ids = sorted({word["transcriptId"] for word in phrase if word.get("transcriptId")})
+        confidence = round(sum(float(word.get("confidence") or 0.6) for word in phrase) / len(phrase), 3)
         phrase_docs.append({
-            "id": f"ph_{index}",
+            "id": phrase_id,
             "text": text,
             "t0": phrase[0]["t0"],
             "t1": phrase[-1]["t1"],
             "wordEvidenceIds": ids_for_phrase,
+            "status": "SUPPORTED",
+            "transcriptIds": transcript_ids,
         })
+        for row in transcript:
+            if row["id"] in transcript_ids:
+                row["phraseIds"].append(phrase_id)
         take({
             "type": "speech_phrase",
             "t0": phrase[0]["t0"],
             "t1": phrase[-1]["t1"],
             "trackId": None,
-            "confidence": 0.6,
+            "confidence": confidence,
             "source": "phrase_segmenter",
             "payload": {"text": text},
         })
-    del word_ids
+    for row in transcript:
+        row.pop("words", None)
 
     tracks = [_export_track(track, "face") for track in face_tracks]
     tracks += [_export_track(track, "hand") for track in hand_tracks]
@@ -180,6 +245,8 @@ def build_video_analysis(path: Path, sha256: str | None = None) -> dict:
         "tracks": tracks,
         "evidence": evidence,
         "phrases": phrase_docs,
+        "transcript": transcript,
+        "limitations": list(FACE_HAND_LIMITATIONS),
         "motion": motion_series,
         "audioBins": bins,
         "unavailable": unavailable,
@@ -194,8 +261,14 @@ def build_video_analysis(path: Path, sha256: str | None = None) -> dict:
     return doc
 
 
-def segment_phrases(words: list[dict]) -> list[list[dict]]:
-    """Split words on punctuation, a pause, or a 6-word cap. Never joins across a split."""
+def segment_phrases(words: list[dict], scene_times: list[float] | None = None) -> list[list[dict]]:
+    """Build phrases from word times. A scene cut is not a boundary.
+
+    A new sentence (capital, end punctuation, or a pause) closes the previous
+    phrase before the 6-word safety cap can cut inside it. Commas stay inside
+    the phrase so a clause is not shortened mid-sentence.
+    """
+    del scene_times  # kept in the signature so callers cannot pass cuts as boundaries by accident
     phrases: list[list[dict]] = []
     bucket: list[dict] = []
     prev_end = None
@@ -210,15 +283,231 @@ def segment_phrases(words: list[dict]) -> list[list[dict]]:
         start = float(word["t0"])
         if bucket and prev_end is not None and start - prev_end >= PHRASE_GAP_S:
             close()
+        if bucket and _is_sentence_start(str(word.get("text") or "")):
+            close()
         if len(bucket) >= PHRASE_MAX_WORDS:
             close()
         bucket.append(word)
         prev_end = float(word["t1"])
         token = str(word.get("text") or "")
-        if token and token[-1] in ".?!…,;:":
+        if token and token[-1] in ".?!…":
             close()
     close()
     return phrases
+
+
+def _is_sentence_start(text: str) -> bool:
+    raw = text.lstrip("\"'“‘(¿¡")
+    if raw == "I":
+        return True
+    if len(raw) < 2 or not raw[0].isupper() or raw[0].isdigit():
+        return False
+    return True
+
+
+class UnusableTranscriptError(ValueError):
+    """Raised when a caption or claim tries to use transcript that is not SUPPORTED."""
+
+
+def phrases_for_editplan(doc: dict, phrase_ids: list[str] | None = None) -> list[dict]:
+    """Return only SUPPORTED phrases. REJECTED and UNCERTAIN cannot be captions or claims."""
+    allowed = {
+        phrase["id"]: phrase
+        for phrase in doc.get("phrases") or []
+        if phrase.get("status", "SUPPORTED") == "SUPPORTED"
+    }
+    blocked: set[str] = set()
+    for row in doc.get("transcript") or []:
+        if row.get("status") == "SUPPORTED":
+            continue
+        blocked.add(str(row.get("id") or ""))
+        for phrase_id in row.get("phraseIds") or []:
+            blocked.add(str(phrase_id))
+    chosen = list(allowed) if phrase_ids is None else list(phrase_ids)
+    refused = [phrase_id for phrase_id in chosen if phrase_id in blocked or phrase_id not in allowed]
+    if refused:
+        raise UnusableTranscriptError(
+            "Texten " + ", ".join(refused) + " är inte SUPPORTED och får inte bli undertext eller påstående."
+        )
+    return [allowed[phrase_id] for phrase_id in chosen]
+
+
+def gate_transcript(
+    segments: list[dict],
+    *,
+    language: str | None,
+    language_probability: float | None,
+    profiles: list[dict | None] | None,
+) -> list[dict]:
+    """Mark each Whisper segment SUPPORTED, UNCERTAIN, or REJECTED.
+
+    Whisper is not usable by itself. A missing audio profile cannot be SUPPORTED.
+    Music, laughter, applause, crowd and other non-speech reject the words.
+    """
+    rows = []
+    for index, segment in enumerate(segments):
+        text = str(segment.get("text") or "").strip()
+        words = [dict(word) for word in segment.get("words") or [] if str(word.get("text") or "").strip()]
+        if not text and not words:
+            continue
+        profile = None if profiles is None else (profiles[index] if index < len(profiles) else None)
+        reasons: list[str] = []
+        status = "SUPPORTED"
+        if segment.get("hallucination"):
+            status = "REJECTED"
+            reasons.append("Känd Whisper-hallucination. Talet redovisas som saknat.")
+        if segment.get("loop"):
+            status = "REJECTED"
+            reasons.append("Samma ord upprepades och togs bort. Det är en Whisper-loop, inte tal.")
+        if _non_latin_script(text) or (language not in (None, "", "en")):
+            status = "REJECTED"
+            reasons.append(
+                f"Språket {language or 'okänt'} ger inte engelsk text som kan användas. Tal saknas hellre än att orden hittas på."
+            )
+        if language_probability is not None and float(language_probability) < LANG_PROB_REJECT:
+            status = "REJECTED"
+            reasons.append(f"Språkdetektorn är osäker ({float(language_probability):.2f}).")
+        has_log = segment.get("avgLogprob") is not None
+        has_noise = segment.get("noSpeechProb") is not None
+        has_compression = segment.get("compressionRatio") is not None
+        avg_logprob = float(segment["avgLogprob"]) if has_log else 0.0
+        no_speech = float(segment["noSpeechProb"]) if has_noise else 0.0
+        compression = float(segment["compressionRatio"]) if has_compression else 0.0
+        if not (has_log and has_noise and has_compression):
+            if status == "SUPPORTED":
+                status = "UNCERTAIN"
+            reasons.append("Whisper-signalerna saknas, så texten kan inte räknas som tal.")
+        if has_log and avg_logprob < LOGPROB_REJECT:
+            status = "REJECTED"
+            reasons.append(f"Whisper avg_logprob {avg_logprob:.2f} är för låg.")
+        if has_compression and compression > COMPRESSION_REJECT:
+            status = "REJECTED"
+            reasons.append(f"Whisper compression_ratio {compression:.2f} tyder på upprepning.")
+        speech = nonspeech = None
+        nonspeech_name = None
+        if profile is None:
+            if status == "SUPPORTED":
+                status = "UNCERTAIN"
+            reasons.append("Ljudklassning saknas, så Whisper räknas inte som tal.")
+        else:
+            speech = float(profile.get("speech") or 0)
+            nonspeech = float(profile.get("nonspeech") or 0)
+            nonspeech_name = profile.get("name")
+            if nonspeech >= YAMNET_MIN and nonspeech > speech + 0.05:
+                status = "REJECTED"
+                reasons.append(f"Ljudet är främst {nonspeech_name or 'icke-tal'}, inte tal.")
+            elif status == "SUPPORTED" and speech < SPEECH_SUPPORT_MIN:
+                status = "UNCERTAIN"
+                reasons.append(f"Tal-score {speech:.2f} räcker inte för att texten ska användas.")
+        if has_noise and no_speech > NO_SPEECH_REJECT and (speech is None or speech < SPEECH_SUPPORT_MIN):
+            status = "REJECTED"
+            reasons.append(f"Whisper no_speech_prob {no_speech:.2f} säger att det inte är tal.")
+        if not words:
+            status = "REJECTED"
+            reasons.append("Segmentet har inga ord.")
+        if status == "SUPPORTED" and not reasons:
+            reasons.append("Engelskt tal, tillräcklig Whisper-signal och ljudklassning som tal.")
+        confidence = _transcript_confidence(status, language_probability, avg_logprob, speech)
+        rows.append({
+            "text": text or " ".join(word["text"] for word in words),
+            "t0": float(segment.get("t0") if segment.get("t0") is not None else words[0]["t0"]),
+            "t1": float(segment.get("t1") if segment.get("t1") is not None else words[-1]["t1"]),
+            "status": status,
+            "confidence": confidence,
+            "reasons": reasons,
+            "language": language,
+            "languageProbability": None if language_probability is None else round(float(language_probability), 3),
+            "avgLogprob": None if segment.get("avgLogprob") is None else round(avg_logprob, 3),
+            "noSpeechProb": None if segment.get("noSpeechProb") is None else round(no_speech, 3),
+            "compressionRatio": None if segment.get("compressionRatio") is None else round(compression, 3),
+            "speechScore": None if speech is None else round(speech, 3),
+            "nonspeechName": nonspeech_name,
+            "nonspeechScore": None if nonspeech is None else round(nonspeech, 3),
+            "words": words,
+            "phraseIds": [],
+        })
+    _reject_repeated_segments(rows)
+    for index, row in enumerate(rows, start=1):
+        row["id"] = f"tr_{index}"
+    return rows
+
+
+def supported_words(rows: list[dict]) -> list[dict]:
+    """Words a later edit plan is allowed to read. REJECTED and UNCERTAIN are omitted."""
+    words = []
+    for row in rows:
+        if row.get("status") != "SUPPORTED":
+            continue
+        for word in row.get("words") or []:
+            words.append({
+                "text": word["text"],
+                "t0": float(word.get("t0", word.get("start"))),
+                "t1": float(word.get("t1", word.get("end"))),
+                "transcriptId": row["id"],
+                "confidence": row["confidence"],
+            })
+    words.sort(key=lambda word: (word["t0"], word["t1"]))
+    return words
+
+
+def _reject_repeated_segments(rows: list[dict]) -> None:
+    index = 0
+    while index < len(rows):
+        token = _norm_token(rows[index].get("text") or "")
+        end = index + 1
+        while end < len(rows) and token and _norm_token(rows[end].get("text") or "") == token:
+            end += 1
+        if token and end - index >= 3:
+            for row in rows[index:end]:
+                row["status"] = "REJECTED"
+                row["confidence"] = min(float(row["confidence"]), 0.2)
+                row["reasons"] = [reason for reason in row["reasons"] if not reason.startswith("Engelskt tal")] + [
+                    "Samma text upprepades och behandlas som en Whisper-loop. Tal saknas."
+                ]
+        index = end
+
+
+def _transcript_confidence(status: str, language_probability: float | None, avg_logprob: float, speech: float | None) -> float:
+    lang = 0.0 if language_probability is None else max(0.0, min(1.0, float(language_probability)))
+    log_score = max(0.0, min(1.0, avg_logprob + 1.0))
+    speech_score = 0.0 if speech is None else max(0.0, min(1.0, speech))
+    raw = 0.4 * lang + 0.3 * log_score + 0.3 * speech_score
+    if status == "REJECTED":
+        raw = min(raw, 0.34)
+    elif status == "UNCERTAIN":
+        raw = min(raw, 0.55)
+    return round(raw, 3)
+
+
+def _non_latin_script(text: str) -> bool:
+    import unicodedata
+    letters = [ch for ch in text if ch.isalpha()]
+    if len(letters) < 2:
+        return False
+    latin = 0
+    for ch in letters:
+        if "LATIN" in unicodedata.name(ch, ""):
+            latin += 1
+    return latin / len(letters) < 0.6
+
+
+def _audio_profile(scores, hop: float, t0: float, t1: float) -> dict:
+    chosen = []
+    for index in range(len(scores)):
+        start = index * hop
+        end = start + 0.96
+        if start < t1 and end > t0:
+            chosen.append(scores[index])
+    if not chosen:
+        return {"speech": 0.0, "nonspeech": 0.0, "name": None}
+    mean = np.mean(np.stack(chosen), axis=0)
+    speech = float(mean[_YAMNET_INDEX["speech"]])
+    best_name, best_score = None, 0.0
+    for name, column in _NONSPEECH:
+        score = float(mean[column])
+        if score > best_score:
+            best_name, best_score = name, score
+    return {"speech": speech, "nonspeech": best_score, "name": best_name}
 
 
 def drop_mouth_open_during_speech(events: list[dict], phrases: list[list[dict]]) -> list[dict]:
@@ -337,6 +626,8 @@ def validate_video_analysis(doc: dict) -> list[str]:
         expect = list(range(indexes[0], indexes[0] + len(indexes)))
         if indexes != expect:
             errors.append(f"Fras {phrase.get('id')} är inte ett sammanhängande ordspann.")
+        if phrase.get("status") not in (None, "SUPPORTED"):
+            errors.append(f"Fras {phrase.get('id')} är inte SUPPORTED och får inte ligga bland fraserna.")
         if used.intersection(wids):
             errors.append(f"Fras {phrase.get('id')} återanvänder ord från en annan fras.")
         used.update(wids)
@@ -345,6 +636,24 @@ def validate_video_analysis(doc: dict) -> list[str]:
                 errors.append(f"Fras {phrase.get('id')} har en bakvänd tid.")
         except (KeyError, TypeError, ValueError):
             errors.append(f"Fras {phrase.get('id')} saknar tid.")
+    phrase_ids = {str(phrase.get("id") or "") for phrase in doc.get("phrases") or []}
+    speech_texts = {
+        str((event.get("payload") or {}).get("text") or "")
+        for event in doc.get("evidence") or []
+        if event.get("type") == "speech_phrase"
+    }
+    for row in doc.get("transcript") or []:
+        if row.get("status") not in {"SUPPORTED", "UNCERTAIN", "REJECTED"}:
+            errors.append(f"Transkript {row.get('id')} har okänd status.")
+            continue
+        if row.get("status") == "SUPPORTED":
+            continue
+        for phrase_id in row.get("phraseIds") or []:
+            if phrase_id in phrase_ids:
+                errors.append(f"Transkript {row.get('id')} är {row.get('status')} men är kopplat till fras {phrase_id}.")
+        blocked = str(row.get("text") or "")
+        if blocked and blocked in speech_texts:
+            errors.append(f"Transkript {row.get('id')} är {row.get('status')} men texten ligger som talbevis.")
     return errors
 
 
@@ -473,6 +782,7 @@ def _motion(path: Path, meta: dict, unavailable: list[dict]) -> tuple[list[dict]
 
 
 def _faces(path: Path, meta: dict, unavailable: list[dict]):
+    """Face tracks only. Darkness, profile, and distance are often missed; that miss is not a fact."""
     loaded = _landmarker("face", unavailable)
     if loaded is None:
         return [], []
@@ -521,6 +831,7 @@ def _faces(path: Path, meta: dict, unavailable: list[dict]):
 
 
 def _hands(path: Path, meta: dict, face_tracks: list[dict], unavailable: list[dict]):
+    """Hand tracks only. Boxes on arms or torso are a known limit, not a named object."""
     loaded = _landmarker("hand", unavailable)
     if loaded is None:
         return [], []
@@ -565,27 +876,47 @@ def _hands(path: Path, meta: dict, face_tracks: list[dict], unavailable: list[di
     return tracks, events
 
 
-def _words(path: Path, has_audio: bool, unavailable: list[dict]) -> list[dict]:
+def _read_transcript(path: Path, has_audio: bool, unavailable: list[dict]) -> dict:
+    empty = {"language": None, "languageProbability": None, "segments": []}
     if not has_audio:
         _unavailable(unavailable, "whisper", "Filen har inget ljudspår.")
-        return []
+        return empty
     try:
-        transcript = transcribe(path)
+        detailed = transcribe_detailed(path)
     except Exception as error:
         _unavailable(unavailable, "whisper", error)
-        return []
+        return empty
     finally:
         _release_whisper()
-    words = []
-    for word in transcript.get("words") or []:
-        text = str(word.get("text") or "").strip()
-        if not text:
-            continue
-        start, end = float(word["start"]), float(word["end"])
-        if end < start:
-            end = start
-        words.append({"text": text, "t0": round(start, 3), "t1": round(end, 3)})
-    return _drop_token_loops(words, unavailable)
+    segments = []
+    for segment in detailed.get("segments") or []:
+        words = []
+        for word in segment.get("words") or []:
+            text = str(word.get("text") or "").strip()
+            if not text:
+                continue
+            start = float(word.get("t0", word.get("start")))
+            end = float(word.get("t1", word.get("end", start)))
+            if end < start:
+                end = start
+            words.append({"text": text, "t0": round(start, 3), "t1": round(end, 3)})
+        kept = _drop_token_loops(words, unavailable)
+        segments.append({
+            "text": " ".join(word["text"] for word in kept) if kept else str(segment.get("text") or ""),
+            "t0": segment.get("t0"),
+            "t1": segment.get("t1"),
+            "avgLogprob": segment.get("avgLogprob"),
+            "noSpeechProb": segment.get("noSpeechProb"),
+            "compressionRatio": segment.get("compressionRatio"),
+            "hallucination": bool(segment.get("hallucination")),
+            "loop": len(kept) < len(words),
+            "words": kept,
+        })
+    return {
+        "language": detailed.get("language"),
+        "languageProbability": detailed.get("languageProbability"),
+        "segments": segments,
+    }
 
 
 def _drop_token_loops(words: list[dict], unavailable: list[dict]) -> list[dict]:
@@ -613,14 +944,19 @@ def _norm_token(text: str) -> str:
     return "".join(ch for ch in text.lower() if ch.isalnum())
 
 
-def _audio(path: Path, duration: float, has_audio: bool, words: list[dict], unavailable: list[dict]):
+def _audio(path: Path, duration: float, has_audio: bool, words: list[dict], unavailable: list[dict], prepared: dict | None = None):
     if not has_audio:
         return [], []
-    audio = _load_audio(path)
-    scores = _yamnet_scores(audio, unavailable)
-    hop = 0.48
-    if scores is not None and len(scores):
-        hop = max(0.05, (len(audio) / 16000) / len(scores))
+    if prepared and prepared.get("audio") is not None:
+        audio = prepared["audio"]
+        scores = prepared.get("scores")
+        hop = float(prepared.get("hop") or 0.48)
+    else:
+        audio = _load_audio(path)
+        scores = _yamnet_scores(audio, unavailable)
+        hop = 0.48
+        if scores is not None and len(scores):
+            hop = max(0.05, (len(audio) / 16000) / len(scores))
     bins = []
     step = int(0.5 * 16000)
     for start in range(0, max(1, len(audio) - 800), step):
