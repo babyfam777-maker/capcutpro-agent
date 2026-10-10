@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -11,7 +12,8 @@ from openai import OpenAI
 
 from .analysis import summary_for_model
 from .config import MODEL, OPENAI_API_KEY, OPENAI_BASE_URL
-from .plan_ops import proposed_spans, timeline
+from .auto_edit import apply_auto_plan, apply_restyle, build_auto_plan, locks_structure, restyle_request
+from .plan_ops import timeline
 
 EventFn = Callable[[str, dict], None]
 
@@ -27,7 +29,8 @@ New video:
 5. commit_render.
 
 Revisions, change only what was asked:
-- bigger text: replace_captions with fontSize or scale (scale also grows headlines).
+- bigger text or a new color: replace_captions with fontSize or scale only. Do not send a new captions list, and do not remove clips or other text.
+- Clip times outside the source duration are rejected. Do not send the whole file when the tool refuses a time.
 - a section is too long: trim_clip or delete_timeline_range.
 - zoom when a word is said: set_zoom with whenText set to that word.
 - undo: call undo and do not render again.
@@ -131,6 +134,14 @@ def run_turn(project, text: str, on_event: EventFn, llm: OpenAI | None = None, f
     final = ""
     nudged = False
     wants_undo = _wants_undo(text)
+    if project.editor.plan["clips"] and not wants_undo:
+        kind = restyle_request(text)
+        if kind:
+            project._restyle = kind
+            project._restyle_text = text
+            project._restyle_lock = locks_structure(text)
+            project._restyle_snapshot = copy.deepcopy(project.editor.plan)
+            project._restyle_applied = False
     for step in range(12):
         choice: Any = {"type": "function", "function": {"name": "undo"}} if wants_undo and not undid else "required"
         try:
@@ -186,6 +197,8 @@ def run_turn(project, text: str, on_event: EventFn, llm: OpenAI | None = None, f
         stop_after = False
         for call in calls:
             on_event("tool", {"name": call["name"], "args": call["args"]})
+            if call["name"] == "commit_render":
+                apply_restyle(project)
             if call["name"] == "commit_render" and force_render is not None:
                 result = force_render(project)
             else:
@@ -341,27 +354,21 @@ def _state_brief(project) -> str:
 
 
 def _seed_from_analysis(project, on_event: EventFn, trace: list[dict]) -> None:
-    """If the model only inspected the video, still build a content-based plan through the same tools."""
-    editor = project.editor
-    for start, end in proposed_spans(editor.analysis):
-        args = {"sourceStart": start, "sourceEnd": end, "label": "moment"}
-        on_event("tool", {"name": "select_clip", "args": args})
-        result = dispatch(project, "select_clip", args, on_event)
-        trace.append({"name": "select_clip", "ok": bool(result.get("ok")), "result": _shrink(result)})
-        on_event("tool_result", {"name": "select_clip", "ok": result.get("ok", True), "result": _shrink(result)})
-        if not result.get("ok"):
-            break
-    if not editor.plan["clips"] or any(effect.get("type") == "text" for effect in editor.plan["effects"]):
-        return
-    words = ((editor.analysis or {}).get("transcript") or {}).get("words") or []
-    headline = " ".join(word["text"] for word in words[:2]).strip() or "LOOK"
-    headline = headline.upper()[:24]
-    accent = max(headline.split(), key=len) if headline.split() else headline
-    args = {"start": 0, "end": 0.9, "text": headline, "accent": accent, "kind": "headline"}
-    on_event("tool", {"name": "add_text", "args": args})
-    result = dispatch(project, "add_text", args, on_event)
-    trace.append({"name": "add_text", "ok": bool(result.get("ok")), "result": _shrink(result)})
-    on_event("tool_result", {"name": "add_text", "ok": result.get("ok", True), "result": _shrink(result)})
+    """If the model only inspected the video, build the cut from the analysis. Never the whole file."""
+    built = build_auto_plan(project.editor.analysis)
+    on_event("tool", {"name": "auto_edit", "args": {}})
+    if not built.get("ok"):
+        result = {"ok": False, "error": built.get("error")}
+    else:
+        apply_auto_plan(project.editor, built)
+        result = {
+            "ok": True,
+            "clips": len(project.editor.plan["clips"]),
+            "hook": (built.get("hook") or {}).get("sourceStart"),
+            "removed": built.get("removed"),
+        }
+    trace.append({"name": "auto_edit", "ok": bool(result.get("ok")), "result": _shrink(result)})
+    on_event("tool_result", {"name": "auto_edit", "ok": result.get("ok", True), "result": _shrink(result)})
     project.save()
 
 
@@ -371,6 +378,7 @@ def _wants_undo(text: str) -> bool:
 
 
 def _force_commit(project, on_event: EventFn, trace: list[dict], force_render=None) -> dict | None:
+    apply_restyle(project)
     on_event("tool", {"name": "commit_render", "args": {"force": True}})
     if force_render is not None:
         result = force_render(project)

@@ -13,6 +13,7 @@ from pathlib import Path
 from .analysis import analyze
 from .config import DATA_DIR
 from .ffmpeg_util import video_meta
+from .auto_edit import apply_restyle, prepare_for_render
 from .plan_ops import Editor, compile_plan, timeline
 from .render import render_plan
 
@@ -107,11 +108,16 @@ class Project:
         return {"ok": True, "analysis": summary_for_model(analysis)}
 
     def commit(self, on_event, force: bool = False) -> dict:
-        problems = _problems(self.editor)
-        if problems and not force:
-            return {"ok": False, "error": "Planen behöver justeras innan render.", "problems": problems}
+        del force  # Hard checks always run. An invalid plan is not rendered as the whole original.
+        apply_restyle(self)
+        prepared = prepare_for_render(self.editor, first_cut=not self.editor.versions)
+        if not prepared["ok"]:
+            return {"ok": False, "error": prepared["error"], "problems": prepared.get("problems") or []}
         if not self.editor.plan["clips"]:
-            return {"ok": False, "error": "Det finns inga klipp att rendera."}
+            return {
+                "ok": False,
+                "error": "Planen är tom. Det finns inga klipp att rendera, och originalvideon används inte som reserv.",
+            }
         on_event("status", {"step": "render"})
         compiled = compile_plan(self.editor.plan, self.editor.analysis)
         version = max([v["version"] for v in self.editor.versions], default=0) + 1
@@ -146,26 +152,6 @@ class Project:
             "outputDuration": round(total, 3),
             "summary": f"v{version} rendered, {probe['duration']:.1f}s, {probe['width']}x{probe['height']} {probe['videoCodec']}.",
         }
-
-
-def _problems(editor: Editor) -> list[str]:
-    rows, total = timeline(editor.plan)
-    problems = []
-    if not rows:
-        problems.append("Inga klipp. Anropa select_clip på de starkaste ögonblicken.")
-        return problems
-    if total > 60:
-        problems.append(f"Tidslinjen är {total:.1f}s. Korta den till under 60s.")
-    if editor.analysis and len(rows) == 1:
-        silence = float(editor.analysis.get("silenceTotal") or 0)
-        duration = float(editor.analysis["source"]["duration"])
-        covered = float(rows[0]["sourceEnd"]) - float(rows[0]["sourceStart"])
-        if silence > 0.8 and covered > duration * 0.92:
-            problems.append("Nästan hela källan är kvar trots tystnad. Klipp bort död tid med flera select_clip.")
-    texts = [e for e in editor.plan["effects"] if e["type"] == "text"] + list(editor.plan["captions"])
-    if not any(float(item["start"]) < 0.8 for item in texts):
-        problems.append("Ingen text i första 0,8s. add_text en engelsk headline på 1-3 ord.")
-    return problems
 
 
 class Store:
