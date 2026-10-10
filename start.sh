@@ -96,7 +96,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Startar workern på ${WORKER_URL}"
-worker/.venv/bin/uvicorn app.main:app --app-dir worker --host 127.0.0.1 --port 8787 >/tmp/capcutpro-worker.log 2>&1 &
+worker/.venv/bin/uvicorn app.main:app --app-dir worker --host "${WORKER_HOST:-127.0.0.1}" --port 8787 >/tmp/capcutpro-worker.log 2>&1 &
 WORKER_PID=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   curl -sf http://127.0.0.1:8787/health >/dev/null && break

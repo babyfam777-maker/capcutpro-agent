@@ -322,7 +322,7 @@ def _effect_sprite(effect: dict, cache: dict):
     elif effect["type"] == "circle":
         sprite = gfx.circle_sprite(100)
     else:
-        sprite = gfx.badge_sprite(effect.get("text") or "")
+        sprite = gfx.badge_sprite(effect.get("text") or "", int(effect.get("fontSize") or 54))
     cache[key] = sprite
     return sprite
 
