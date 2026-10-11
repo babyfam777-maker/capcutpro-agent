@@ -86,16 +86,18 @@ def post_message(project_id: str, body: dict):
     text = str(body.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "Text saknas.")
-    if not project.busy:
-        project.busy = True
-    else:
-        raise HTTPException(409, "En redigering pågår redan för den här videon.")
+    return _sse(project, lambda on_event: run_turn(project, text, on_event))
 
+
+def _sse(project: Project, work_fn):
+    if project.busy:
+        raise HTTPException(409, "En redigering pågår redan för den här videon.")
+    project.busy = True
     events: queue.Queue = queue.Queue()
 
     def work():
         try:
-            run_turn(project, text, lambda event, data: events.put((event, data)))
+            work_fn(lambda event, data: events.put((event, data)))
         except Exception as error:
             events.put(("error", {"message": str(error)}))
         finally:

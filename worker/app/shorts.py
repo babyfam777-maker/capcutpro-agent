@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 
+from .export_spec import SHORT_EXPORT
 from .mvp import build_storyboard, plan_from_storyboard, qa_output, renderer_view
 from .render import render_plan
 from .revisions import apply_edits
@@ -28,6 +29,9 @@ def render_first_short(project, prompt: str, on_event) -> dict:
     on_event("analysis", {
         "cached": bool(found.get("cached")),
         "duration": (analysis.get("source") or {}).get("duration"),
+        "width": (analysis.get("source") or {}).get("width"),
+        "height": (analysis.get("source") or {}).get("height"),
+        "fps": (analysis.get("source") or {}).get("fps"),
         "phrases": len(phrases),
         "faces": len([track for track in analysis.get("tracks") or [] if track.get("kind") == "face"]),
         "scenes": len(analysis.get("scenes") or []),
@@ -45,27 +49,7 @@ def render_first_short(project, prompt: str, on_event) -> dict:
     except Exception:
         project.editor.plan = previous
         raise
-    hook = (board.get("fields") or {}).get("hook") or ""
-    reply = (
-        f"v{saved['version']} är klar"
-        f" ({float((saved.get('probe') or {}).get('duration') or 0):.1f}s, "
-        f"{(saved.get('probe') or {}).get('width')}x{(saved.get('probe') or {}).get('height')}). "
-        f"Hook: {hook}."
-    )
-    if board.get("limitations"):
-        reply += " " + str(board["limitations"][0])
-    project.messages.append({"role": "assistant", "content": reply, "trace": [{"name": "render_plan", "ok": True}]})
-    project.save_messages()
-    on_event("version", {"activeVersion": saved["version"]})
-    on_event("done", {
-        "reply": reply,
-        "activeVersion": saved["version"],
-        "videoUrl": saved["videoUrl"],
-        "probe": saved.get("probe"),
-        "qa": saved.get("qa"),
-        "hook": hook,
-    })
-    return saved
+    return _finish(project, saved, board, on_event)
 
 
 def render_again(project, lines: list[str], on_event) -> dict:
@@ -90,6 +74,9 @@ def render_again(project, lines: list[str], on_event) -> dict:
     reply = f"v{saved['version']} är klar. " + " ".join(edited["changes"])
     if edited["skipped"]:
         reply += " Förstod inte: " + "; ".join(edited["skipped"]) + "."
+    quality = (saved.get("probe") or {}).get("quality")
+    if quality and quality != "native":
+        reply += f" Exporten är {quality}."
     project.messages.append({
         "role": "assistant",
         "content": reply,
@@ -109,6 +96,47 @@ def render_again(project, lines: list[str], on_event) -> dict:
     return saved
 
 
+def _finish(project, saved: dict, board: dict, on_event) -> dict:
+    probe = saved.get("probe") or {}
+    hook = (board.get("fields") or {}).get("hook") or ""
+    quality = probe.get("quality") or (saved.get("plan") or {}).get("export", {}).get("quality") or ""
+    reply = (
+        f"v{saved['version']} är klar"
+        f" ({float(probe.get('duration') or 0):.1f}s, "
+        f"{probe.get('width')}x{probe.get('height')}"
+        f"{', ' + quality if quality else ''}). "
+        f"Hook: {hook}."
+    )
+    limit = ((board.get("length") or {}).get("reason")) or ""
+    if limit:
+        reply += " " + limit
+    elif board.get("limitations"):
+        reply += " " + str(board["limitations"][0])
+    project.messages.append({"role": "assistant", "content": reply, "trace": [{"name": "render_plan", "ok": True}]})
+    project.save_messages()
+    on_event("version", {"activeVersion": saved["version"]})
+    on_event("done", {
+        "reply": reply,
+        "activeVersion": saved["version"],
+        "videoUrl": saved["videoUrl"],
+        "probe": probe,
+        "qa": saved.get("qa"),
+        "hook": hook,
+        "beats": [
+            {
+                "role": beat.get("role"),
+                "sourceStart": beat.get("sourceStart"),
+                "sourceEnd": beat.get("sourceEnd"),
+                "speed": beat.get("speed"),
+                "why": beat.get("why"),
+            }
+            for beat in board.get("beats") or []
+        ],
+        "length": board.get("length"),
+    })
+    return saved
+
+
 def _render(project, plan: dict, view: dict, on_event) -> dict:
     on_event("status", {"step": "render"})
     version, folder = project.next_version_folder()
@@ -119,16 +147,19 @@ def _render(project, plan: dict, view: dict, on_event) -> dict:
         plan,
         out,
         on_progress=lambda progress: on_event("progress", {"progress": round(progress, 3)}),
+        delivery=SHORT_EXPORT,
     )
     on_event("status", {"step": "qa"})
     qa = None
     try:
         analysis = _read_analysis(project)
-        qa = qa_output(out, plan, analysis or {"transcript": []})
+        qa = qa_output(out, plan, analysis or {"transcript": [], "source": {}})
     except Exception as error:
         qa = {"ok": False, "checks": [{"name": "qa", "ok": False, "detail": str(error)}]}
     on_event("qa", qa)
-    return project.save_version(version, plan, probe, qa)
+    saved = project.save_version(version, plan, probe, qa)
+    saved["plan"] = plan
+    return saved
 
 
 def _write_storyboard(project, board: dict) -> None:
@@ -138,9 +169,17 @@ def _write_storyboard(project, board: dict) -> None:
         "prompt": board.get("prompt"),
         "fields": board.get("fields"),
         "beats": [
-            {"role": beat.get("role"), "why": beat.get("why"), "text": beat.get("text")}
+            {
+                "role": beat.get("role"),
+                "sourceStart": beat.get("sourceStart"),
+                "sourceEnd": beat.get("sourceEnd"),
+                "speed": beat.get("speed"),
+                "why": beat.get("why"),
+                "text": beat.get("text"),
+            }
             for beat in board.get("beats") or []
         ],
+        "length": board.get("length"),
         "limitations": board.get("limitations") or [],
     })
 

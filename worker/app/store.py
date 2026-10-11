@@ -46,6 +46,7 @@ class Project:
         self.editor.active = self.state.get("activeVersion")
         self.editor.dirty = bool(self.state.get("dirty"))
         self.editor.versions = self._load_versions()
+        self.render_view = _read(folder / "render_view.json")
         self.busy = False
 
     def _load_versions(self) -> list[dict]:
@@ -204,7 +205,7 @@ class Project:
         return version, folder
 
     def save_version(self, version: int, plan: dict, probe: dict, qa: dict | None = None) -> dict:
-        """Store a rendered MP4. Does not rebuild the plan through the v1 auto-editor."""
+        """Store a rendered MP4 without running the v1 auto-editor."""
         before = self.original_hash
         after = hashlib.sha256(self.original.read_bytes()).hexdigest()
         if before and before != after:
