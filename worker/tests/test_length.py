@@ -89,6 +89,32 @@ def test_ten_second_source_becomes_a_real_short(monkeypatch):
     assert any(effect.get("kind") == "headline" for effect in plan["effects"])
 
 
+def test_a_short_motion_hook_keeps_the_headline(monkeypatch):
+    monkeypatch.setattr("app.mvp._ask_model", lambda prompt, fallback: None)
+    doc = _quiet(11.0, fps=60)
+    doc["scenes"] = []
+    doc["evidence"] = [{
+        "id": "ev_1",
+        "type": "motion",
+        "t0": 9.5,
+        "t1": 9.75,
+        "trackId": None,
+        "confidence": 0.8,
+        "source": "farneback",
+        "payload": {},
+    }]
+    plan = plan_from_storyboard(build_storyboard(doc, "make a short"), doc)
+    hook = plan["clips"][0]
+    assert hook["label"] == "hook"
+    assert float(hook["sourceEnd"]) - float(hook["sourceStart"]) >= 1.0
+    assert float(hook["sourceEnd"]) <= 11.05
+    headline = next(effect for effect in plan["effects"] if effect.get("kind") == "headline")
+    assert headline["text"]
+    edited = apply_edits(plan, ["Gör hooken större"])
+    grown = next(effect for effect in edited["plan"]["effects"] if effect.get("kind") == "headline")
+    assert int(grown["fontSize"]) > int(headline["fontSize"])
+
+
 def test_two_second_source_reports_why_it_cannot_reach_13(monkeypatch):
     monkeypatch.setattr("app.mvp._ask_model", lambda prompt, fallback: None)
     doc = _quiet(2.0)

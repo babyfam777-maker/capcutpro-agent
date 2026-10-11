@@ -79,6 +79,9 @@ def build_storyboard(analysis: dict, prompt: str) -> dict:
     else:
         hook_span, hook_why = _visual_hook(duration, cuts, motions, smiles, laughs)
     hook_span = _clamp_span(*hook_span, duration)
+    # The headline needs about a second on screen. Extend with real frames
+    # around the moment instead of dropping the hook text.
+    hook_span = _room_for_hook(hook_span, duration, 1.05)
 
     beats = [{
         "role": "HOOK",
@@ -510,6 +513,19 @@ def _visual_beats(duration, hook_span, cuts, motions, smiles):
     if not chosen and duration > 1.5:
         chosen.append((_clamp_span(0.0, min(duration, 1.4), duration), "Början av filen, eftersom inget senare bildbevis valdes."))
     return chosen
+
+
+def _room_for_hook(span: tuple[float, float], duration: float, minimum: float) -> tuple[float, float]:
+    start, end = span
+    if end - start >= minimum or duration < minimum:
+        if duration < minimum:
+            return 0.0, duration
+        return start, end
+    extra = minimum - (end - start)
+    start = max(0.0, start - extra / 2)
+    end = min(duration, start + minimum)
+    start = max(0.0, end - minimum)
+    return start, end
 
 
 def _seconds(beats: list[dict]) -> float:
