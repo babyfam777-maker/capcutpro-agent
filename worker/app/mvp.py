@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .analysis_v2 import phrases_for_editplan
 from .config import MODEL, OPENAI_API_KEY, OPENAI_BASE_URL
+from .export_spec import SHORT_EXPORT, describe_export
 from .ffmpeg_util import probe, run
 from .plan_ops import empty_plan, min_readable_seconds, timeline
 from .render import render_plan
@@ -20,6 +21,11 @@ from .safety import lint_emoji, lint_text
 
 _FILLER = {"um", "uh", "hmm", "ah", "er", "but", "like", "so", "yeah", "ok", "okay"}
 _HOOK_FALLBACK = "LOOK"
+# A Short should land on at least this much real timeline. The extra tenth
+# covers frame rounding so the encoded file still probes at >= 13s.
+MIN_SHORT_S = 13.0
+_AIM_S = 13.25
+_SLOW_SPEED = 0.5
 
 
 def produce_short(video: Path, analysis: dict, prompt: str, out_path: Path) -> dict:
@@ -28,7 +34,7 @@ def produce_short(video: Path, analysis: dict, prompt: str, out_path: Path) -> d
     plan = plan_from_storyboard(board, analysis)
     view = renderer_view(analysis)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    info = render_plan(Path(video), view, plan, Path(out_path))
+    info = render_plan(Path(video), view, plan, Path(out_path), delivery=SHORT_EXPORT)
     qa = qa_output(Path(out_path), plan, analysis)
     return {"storyboard": board, "plan": plan, "render": info, "qa": qa}
 
@@ -73,6 +79,9 @@ def build_storyboard(analysis: dict, prompt: str) -> dict:
     else:
         hook_span, hook_why = _visual_hook(duration, cuts, motions, smiles, laughs)
     hook_span = _clamp_span(*hook_span, duration)
+    # The headline needs about a second on screen. Extend with real frames
+    # around the moment instead of dropping the hook text.
+    hook_span = _room_for_hook(hook_span, duration, 1.05)
 
     beats = [{
         "role": "HOOK",
@@ -155,12 +164,23 @@ def build_storyboard(analysis: dict, prompt: str) -> dict:
         })
 
     fields = _fields(prompt, hook_phrase, bool(smile or laughs), bool(phrases))
+    note = _reach_target(beats, duration, analysis)
+    limitations = list(analysis.get("limitations") or [])
+    if note:
+        limitations.append(note)
+    seconds = round(_seconds(beats), 3)
     return {
         "prompt": prompt,
         "beats": beats,
         "fields": fields,
         "blockedTexts": sorted(blocked),
-        "limitations": list(analysis.get("limitations") or []),
+        "limitations": limitations,
+        "length": {
+            "target": MIN_SHORT_S,
+            "seconds": seconds,
+            "reached": seconds + 1e-3 >= MIN_SHORT_S,
+            "reason": note,
+        },
     }
 
 
@@ -316,6 +336,13 @@ def plan_from_storyboard(board: dict, analysis: dict) -> dict:
 
     plan["effects"] = effects
     plan["storyCaptions"] = captions
+    length = board.get("length") or {}
+    plan["export"] = describe_export(analysis.get("source") or {})
+    plan["export"]["targetSeconds"] = MIN_SHORT_S
+    plan["export"]["plannedSeconds"] = length.get("seconds")
+    plan["export"]["lengthReached"] = bool(length.get("reached"))
+    if length.get("reason"):
+        plan["export"]["lengthLimit"] = length["reason"]
     _assert_plan_safe(plan, board["blockedTexts"])
     return plan
 
@@ -332,10 +359,30 @@ def qa_output(path: Path, plan: dict, analysis: dict) -> dict:
     def check(name: str, ok: bool, detail: str) -> None:
         checks.append({"name": name, "ok": bool(ok), "detail": detail})
 
-    check("duration", duration > 0.8, f"{duration:.3f}s")
-    check("resolution", int(video.get("width") or 0) == 1080 and int(video.get("height") or 0) == 1920, f"{video.get('width')}x{video.get('height')}")
-    check("codec", video.get("codec_name") == "h264" and audio.get("codec_name") == "aac", f"{video.get('codec_name')}/{audio.get('codec_name')}")
-    check("fps", abs(fps - 30) < 0.2, rate)
+    spec = describe_export(analysis.get("source") or {})
+    limit = (plan.get("export") or {}).get("lengthLimit")
+    if limit:
+        check("duration", duration > 0.8, f"{duration:.3f}s; {limit}")
+    else:
+        check("duration", duration + 0.05 >= MIN_SHORT_S, f"{duration:.3f}s")
+    check(
+        "resolution",
+        int(video.get("width") or 0) == spec["width"] and int(video.get("height") or 0) == spec["height"],
+        f"{video.get('width')}x{video.get('height')}",
+    )
+    profile = str(video.get("profile") or "")
+    check(
+        "codec",
+        video.get("codec_name") == "h264"
+        and "high" in profile.lower()
+        and video.get("pix_fmt") == "yuv420p"
+        and audio.get("codec_name") == "aac",
+        f"{video.get('codec_name')} {profile} {video.get('pix_fmt')}/{audio.get('codec_name')}",
+    )
+    check("fps", abs(fps - spec["fps"]) < 0.8, rate)
+    comment = str(((data.get("format") or {}).get("tags") or {}).get("comment") or "")
+    honest = comment == spec["quality"] and (spec["quality"] == "native" or "native" not in comment.split(","))
+    check("quality_label", honest, f"{comment or 'saknas'} (källa {spec['quality']})")
     check("audio", bool(audio), "ljudspår finns" if audio else "ljudspår saknas")
     loud = _mean_volume(path)
     check("not_silent", loud is not None and loud > -45, f"mean {loud} dB" if loud is not None else "okänd")
@@ -466,6 +513,227 @@ def _visual_beats(duration, hook_span, cuts, motions, smiles):
     if not chosen and duration > 1.5:
         chosen.append((_clamp_span(0.0, min(duration, 1.4), duration), "Början av filen, eftersom inget senare bildbevis valdes."))
     return chosen
+
+
+def _room_for_hook(span: tuple[float, float], duration: float, minimum: float) -> tuple[float, float]:
+    start, end = span
+    if end - start >= minimum or duration < minimum:
+        if duration < minimum:
+            return 0.0, duration
+        return start, end
+    extra = minimum - (end - start)
+    start = max(0.0, start - extra / 2)
+    end = min(duration, start + minimum)
+    start = max(0.0, end - minimum)
+    return start, end
+
+
+def _seconds(beats: list[dict]) -> float:
+    return sum(_beat_seconds(beat) for beat in beats)
+
+
+def _beat_seconds(beat: dict) -> float:
+    speed = float(beat.get("speed") or 1)
+    if speed <= 0.001:
+        return float(beat.get("holdSec") or 0.11)
+    return max(0.0, (float(beat["sourceEnd"]) - float(beat["sourceStart"])) / speed)
+
+
+def _needs_more(beats: list[dict]) -> bool:
+    return _seconds(beats) + 1e-3 < _AIM_S
+
+
+def _reach_target(beats: list[dict], duration: float, analysis: dict) -> str | None:
+    """Use real footage until the timeline can be a Short.
+
+    A source shorter than 13s may be retold with a flash-forward hook (already
+    chosen), one full chronological pass, and one slow-motion replay. Nothing
+    here adds black, a freeze, or a second loop of the same device.
+    """
+    if duration <= 0 or not _needs_more(beats):
+        return None
+    if duration + 0.02 < MIN_SHORT_S:
+        if not _has_full_pass(beats, duration):
+            _insert_before_replay(beats, _chrono_beat(
+                0.0,
+                duration,
+                "Hela klippet i tidsordning. Bara bilder som finns i källan.",
+                duration,
+            ))
+        if _needs_more(beats):
+            _add_slowmo(beats, duration, analysis, _AIM_S - _seconds(beats))
+    else:
+        _add_unused(beats, duration)
+        if _needs_more(beats):
+            need = _AIM_S - _seconds(beats)
+            _insert_before_replay(beats, _chrono_beat(
+                0.0,
+                min(duration, max(need, 0.2)),
+                "Kronologisk del av källan så shortsen når 13 sekunder.",
+                duration,
+            ))
+        if _needs_more(beats):
+            _add_slowmo(beats, duration, analysis, _AIM_S - _seconds(beats))
+    if not _needs_more(beats):
+        return None
+    got = _seconds(beats)
+    return (
+        f"Källan är {duration:.2f} s. En hook av ett verkligt ögonblick, hela klippet i tidsordning "
+        f"och en slow-motion-repris räcker till {got:.2f} s. "
+        f"13 s skulle kräva svarta rutor, frysrutor eller fler loopar, och de läggs inte till."
+    )
+
+
+def _add_unused(beats: list[dict], duration: float) -> None:
+    need = _AIM_S - _seconds(beats)
+    extras = []
+    for start, end in _gaps(_covered(beats), duration):
+        if need <= 0.02:
+            break
+        if end - start < 0.2:
+            continue
+        take = min(end - start, need)
+        extras.append(_chrono_beat(
+            start,
+            start + take,
+            "Kronologiskt material från källan som urvalet hade hoppat över.",
+            duration,
+        ))
+        need -= take
+    _insert_before_replay(beats, *[beat for beat in extras if beat])
+
+
+def _add_slowmo(beats: list[dict], duration: float, analysis: dict, need: float) -> None:
+    if need <= 0.02:
+        return
+    hook = next((beat for beat in beats if beat.get("role") == "HOOK"), None)
+    hook_span = (
+        (float(hook["sourceStart"]), float(hook["sourceEnd"]))
+        if hook else (0.0, min(duration, 1.2))
+    )
+    t0, t1, why = _reaction_span(analysis, hook_span)
+    existing = next((beat for beat in beats if beat.get("role") == "REPLAY"), None)
+    target_out = need + (_beat_seconds(existing) if existing else 0.0)
+    event_len = max(0.2, t1 - t0)
+    want = min(duration, max(event_len, target_out * _SLOW_SPEED, 0.45))
+    center = (t0 + t1) / 2
+    start = max(0.0, center - want / 2)
+    end = min(duration, start + want)
+    start = max(0.0, end - want)
+    if end - start < 0.2:
+        return
+    speed = _SLOW_SPEED
+    produced = (end - start) / speed
+    if produced > target_out + 1.25 and target_out > 0:
+        speed = min(0.75, max(_SLOW_SPEED, (end - start) / target_out))
+        speed = math.floor(speed * 1000 + 1e-9) / 1000
+        produced = (end - start) / speed
+    if existing and produced <= _beat_seconds(existing) + 0.02:
+        return
+    beat = {
+        "role": "REPLAY",
+        "sourceStart": round(start, 3),
+        "sourceEnd": round(end, 3),
+        "speed": round(max(_SLOW_SPEED, speed), 3),
+        "zoomStart": 1.12,
+        "zoomEnd": 1.28,
+        "why": why,
+        "phraseId": None,
+    }
+    face = _face_during(analysis, start, end)
+    if face:
+        beat["trackId"] = face
+    if existing:
+        existing.clear()
+        existing.update(beat)
+        return
+    beats.append(beat)
+
+
+def _reaction_span(analysis: dict, hook_span: tuple[float, float]) -> tuple[float, float, str]:
+    named = (
+        ("smile", "leendet"),
+        ("laughter", "skrattet"),
+        ("mouth_open", "reaktionen"),
+        ("point", "gesten"),
+    )
+    for kind, label in named:
+        event = _strongest(_events(analysis, kind))
+        if event and float(event["t1"]) - float(event["t0"]) >= 0.2:
+            return float(event["t0"]), float(event["t1"]), f"Slow motion av {label} ({event['id']})."
+    motion = _strongest(_events(analysis, "motion"))
+    if motion and float(motion["t1"]) - float(motion["t0"]) >= 0.2:
+        return float(motion["t0"]), float(motion["t1"]), f"Slow motion av rörelsen {motion['id']}."
+    return hook_span[0], hook_span[1], "Slow motion av det starkaste ögonblicket i källan."
+
+
+def _chrono_beat(start: float, end: float, why: str, duration: float) -> dict | None:
+    start = max(0.0, min(start, duration))
+    end = max(start, min(end, duration))
+    if end - start < 0.2:
+        return None
+    return {
+        "role": "STORY",
+        "sourceStart": round(start, 3),
+        "sourceEnd": round(end, 3),
+        "speed": 1.0,
+        "zoomStart": 1.0,
+        "zoomEnd": 1.06,
+        "why": why,
+        "phraseId": None,
+    }
+
+
+def _insert_before_replay(beats: list[dict], *extra: dict | None) -> None:
+    rows = [beat for beat in extra if beat]
+    if not rows:
+        return
+    for index, beat in enumerate(beats):
+        if beat.get("role") == "REPLAY":
+            beats[index:index] = rows
+            return
+    beats.extend(rows)
+
+
+def _has_full_pass(beats: list[dict], duration: float) -> bool:
+    for beat in beats:
+        if beat.get("role") == "REPLAY" or float(beat.get("speed") or 1) <= 0.001:
+            continue
+        if abs(float(beat.get("speed") or 1) - 1) > 0.08:
+            continue
+        if float(beat["sourceStart"]) <= 0.08 and float(beat["sourceEnd"]) >= duration - 0.08:
+            return True
+    return False
+
+
+def _covered(beats: list[dict]) -> list[tuple[float, float]]:
+    spans = []
+    for beat in beats:
+        if float(beat.get("speed") or 1) <= 0.001:
+            continue
+        spans.append((float(beat["sourceStart"]), float(beat["sourceEnd"])))
+    if not spans:
+        return []
+    spans.sort()
+    merged = [list(spans[0])]
+    for start, end in spans[1:]:
+        if start <= merged[-1][1] + 0.05:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _gaps(spans: list[tuple[float, float]], duration: float) -> list[tuple[float, float]]:
+    cursor = 0.0
+    gaps = []
+    for start, end in spans:
+        if start > cursor + 0.05:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if duration > cursor + 0.05:
+        gaps.append((cursor, duration))
+    return gaps
 
 
 def _fields(prompt: str, phrase: dict | None, reaction: bool, has_speech: bool) -> dict:

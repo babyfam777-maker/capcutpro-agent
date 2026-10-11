@@ -91,7 +91,7 @@ class _Ids:
         return f"ev_{self._n}"
 
 
-def build_video_analysis(path: Path, sha256: str | None = None) -> dict:
+def build_video_analysis(path: Path, sha256: str | None = None, on_step=None) -> dict:
     """Read the file duration, then collect evidence. Raises if the duration is missing."""
     path = Path(path)
     rss_before = _rss_mb()
@@ -99,6 +99,8 @@ def build_video_analysis(path: Path, sha256: str | None = None) -> dict:
     unavailable: list[dict] = []
 
     def timed(name, fn):
+        if on_step:
+            on_step(name)
         start = __import__("time").perf_counter()
         try:
             return fn()
