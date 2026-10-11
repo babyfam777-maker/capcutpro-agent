@@ -1,9 +1,15 @@
-"""Turn a plan into a real 1080x1920 H.264 MP4. The model never calls FFmpeg itself."""
+"""Turn a plan into an H.264 MP4. The model never calls FFmpeg itself.
+
+The v1 path stays 1080x1920 at 30 fps. A Short delivery upscales with lanczos
+and, when the source is below 60 fps, interpolates. That conversion is labeled.
+"""
 
 from __future__ import annotations
 
+import contextvars
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +17,7 @@ from PIL import Image
 
 from . import gfx
 from .config import FPS, OUT_H, OUT_W
+from .export_spec import describe_export
 from .ffmpeg_util import probe, run
 from .plan_ops import timeline
 from .sfx import ensure_sfx
@@ -20,21 +27,83 @@ SAFE_BOTTOM = 320
 SAFE_SIDE = 60
 
 
-def render_plan(original: Path, analysis: dict, plan: dict, out_path: Path, on_progress=None) -> dict:
+@dataclass
+class Canvas:
+    w: int
+    h: int
+    fps: float
+    factor: float = 1.0
+    spec: dict | None = None
+
+    @property
+    def safe_top(self) -> int:
+        return int(round(SAFE_TOP * self.factor))
+
+    @property
+    def safe_bottom(self) -> int:
+        return int(round(SAFE_BOTTOM * self.factor))
+
+    @property
+    def safe_side(self) -> int:
+        return int(round(SAFE_SIDE * self.factor))
+
+
+_CANVAS: contextvars.ContextVar[Canvas | None] = contextvars.ContextVar("capcut_canvas", default=None)
+
+
+def _canvas() -> Canvas:
+    current = _CANVAS.get()
+    if current is None:
+        return Canvas(OUT_W, OUT_H, float(FPS))
+    return current
+
+
+def _canvas_for(analysis: dict, delivery: dict | None) -> Canvas:
+    if not delivery:
+        return Canvas(OUT_W, OUT_H, float(FPS))
+    source = (analysis or {}).get("source") or {}
+    spec = describe_export(source, delivery)
+    source_fps = float(source.get("fps") or 0)
+    compose_fps = source_fps if spec["interpolated"] and source_fps >= 1 else float(delivery["fps"])
+    if spec["upscaled"]:
+        # Graphics stay on the 1080x1920 grid. Lanczos performs the upscale.
+        return Canvas(OUT_W, OUT_H, compose_fps, 1.0, spec)
+    factor = float(delivery["height"]) / float(OUT_H)
+    return Canvas(int(delivery["width"]), int(delivery["height"]), compose_fps, factor, spec)
+
+
+def render_plan(original: Path, analysis: dict, plan: dict, out_path: Path, on_progress=None, delivery: dict | None = None) -> dict:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     rows, _ = timeline(plan)
     if not rows:
         raise RuntimeError("Planen har inga klipp.")
-    sfx = ensure_sfx()
-    with tempfile.TemporaryDirectory(prefix="capcut-") as tmp:
-        tmp_path = Path(tmp)
-        speech = tmp_path / "speech.wav"
-        mastered = tmp_path / "master.wav"
-        _build_speech(original, analysis, plan, speech)
-        _mix(speech, plan, sfx, tmp_path / "mixed.wav")
-        _loudnorm(tmp_path / "mixed.wav", mastered)
-        _encode(original, analysis, plan, mastered, out_path, on_progress)
-    info = _inspect(out_path)
+    canvas = _canvas_for(analysis, delivery)
+    token = _CANVAS.set(canvas)
+    try:
+        sfx = ensure_sfx()
+        with tempfile.TemporaryDirectory(prefix="capcut-") as tmp:
+            tmp_path = Path(tmp)
+            speech = tmp_path / "speech.wav"
+            mastered = tmp_path / "master.wav"
+            _build_speech(original, analysis, plan, speech)
+            _mix(speech, plan, sfx, tmp_path / "mixed.wav")
+            _loudnorm(tmp_path / "mixed.wav", mastered)
+            _encode(original, analysis, plan, mastered, out_path, on_progress)
+        info = _inspect(out_path)
+        return _annotate(info, canvas.spec)
+    finally:
+        _CANVAS.reset(token)
+
+
+def _annotate(info: dict, spec: dict | None) -> dict:
+    if not spec:
+        return info
+    quality = spec["quality"]
+    if (spec["upscaled"] or spec["interpolated"]) and "native" in quality.split(","):
+        quality = ",".join(part for part in ("upscaled" if spec["upscaled"] else "", "interpolated" if spec["interpolated"] else "") if part)
+    info["upscaled"] = bool(spec["upscaled"])
+    info["interpolated"] = bool(spec["interpolated"])
+    info["quality"] = quality
     return info
 
 
@@ -44,8 +113,8 @@ def _build_speech(original: Path, analysis: dict, plan: dict, dest: Path) -> Non
     parts = []
     labels = []
     for i, row in enumerate(rows):
-        frames = max(1, round((row["outEnd"] - row["outStart"]) * FPS))
-        dur = frames / FPS
+        frames = max(1, round((row["outEnd"] - row["outStart"]) * _canvas().fps))
+        dur = frames / _canvas().fps
         if not has_audio or float(row["speed"]) <= 0.001:
             parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{dur:.4f},asetpts=PTS-STARTPTS[a{i}]")
         else:
@@ -116,27 +185,62 @@ def _loudnorm(src: Path, dest: Path) -> None:
     nudged.replace(dest)
 
 
+def _output_filters(spec: dict | None) -> tuple[str, float]:
+    canvas = _canvas()
+    parts = ["unsharp=5:5:0.28:5:5:0.0"]
+    out_fps = canvas.fps
+    if spec and spec.get("interpolated"):
+        out_fps = float(spec["fps"])
+        parts.append(f"minterpolate=fps={out_fps:.3f}:mi_mode=blend")
+    if spec and spec.get("upscaled"):
+        parts.append(f"scale={int(spec['width'])}:{int(spec['height'])}:flags=lanczos")
+    return ",".join(parts), out_fps
+
+
 def _encode(original: Path, analysis: dict, plan: dict, audio: Path, out_path: Path, on_progress) -> None:
+    spec = _canvas().spec
+    filters, out_fps = _output_filters(spec)
+    try:
+        _encode_pipe(original, analysis, plan, audio, out_path, on_progress, filters, out_fps, spec)
+    except Exception:
+        if not spec or not spec.get("interpolated") or "minterpolate" not in filters:
+            raise
+        fallback = filters.replace(f"minterpolate=fps={out_fps:.3f}:mi_mode=blend", f"fps={out_fps:.3f}")
+        _encode_pipe(original, analysis, plan, audio, out_path, on_progress, fallback, out_fps, spec)
+
+
+def _encode_pipe(original, analysis, plan, audio, out_path, on_progress, filters: str, out_fps: float, spec: dict | None) -> None:
+    canvas = _canvas()
     rows, _ = timeline(plan)
     sw, sh = int(analysis["source"]["width"]), int(analysis["source"]["height"])
     jobs = []
     total = 0
     for row in rows:
-        frames = max(1, round((row["outEnd"] - row["outStart"]) * FPS))
+        frames = max(1, round((row["outEnd"] - row["outStart"]) * canvas.fps))
         jobs.append((row, frames))
         total += frames
+    rate = f"{canvas.fps:.3f}"
     cmd = [
         "ffmpeg", "-y", "-v", "error",
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{OUT_W}x{OUT_H}", "-r", str(FPS), "-i", "pipe:0",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{canvas.w}x{canvas.h}", "-r", rate, "-i", "pipe:0",
         "-i", str(audio),
-        "-vf", "unsharp=5:5:0.28:5:5:0.0",
-        "-c:v", "libx264", "-profile:v", "high", "-preset", "veryfast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-r", str(FPS),
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+        "-vf", filters,
+        "-c:v", "libx264", "-profile:v", "high", "-preset", "veryfast",
+        "-pix_fmt", "yuv420p", "-r", f"{out_fps:.3f}",
+        "-c:a", "aac", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart",
         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-        "-shortest", str(out_path),
     ]
+    if spec:
+        # Cap the 4K stream so a phone can play it. CRF 18 at 2160x3840@60 is too heavy.
+        cmd += [
+            "-b:a", "160k",
+            "-crf", "22", "-maxrate", "10M", "-bufsize", "20M", "-level:v", "5.2",
+            "-metadata", f"comment={spec['quality']}",
+        ]
+    else:
+        cmd += ["-b:a", "192k", "-crf", "18"]
+    cmd += ["-shortest", str(out_path)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.stdin is not None
     cache: dict = {}
@@ -145,10 +249,10 @@ def _encode(original: Path, analysis: dict, plan: dict, audio: Path, out_path: P
     flash = any(e["type"] == "text" and e.get("kind") == "headline" and float(e["start"]) < 0.2 for e in plan["effects"])
     try:
         for row, frames in jobs:
-            decoded = _decode_clip(original, row, frames, sw, sh)
-            for index, frame in enumerate(decoded):
+            index = 0
+            for frame in _iter_clip_frames(original, row, frames, sw, sh):
                 u = index / max(1, frames - 1)
-                out_t = float(row["outStart"]) + index / FPS
+                out_t = float(row["outStart"]) + index / canvas.fps
                 src_span = float(row["sourceEnd"]) - float(row["sourceStart"])
                 src_t = float(row["sourceStart"]) if float(row["speed"]) <= 0.001 else float(row["sourceStart"]) + src_span * u
                 target = _focus_point(analysis, row, src_t)
@@ -165,6 +269,7 @@ def _encode(original: Path, analysis: dict, plan: dict, audio: Path, out_path: P
                 _composite(image, plan, out_t, faces, cache)
                 proc.stdin.write(image.tobytes())
                 done += 1
+                index += 1
                 if on_progress and done % 10 == 0:
                     on_progress(done / total)
         proc.stdin.close()
@@ -179,14 +284,20 @@ def _encode(original: Path, analysis: dict, plan: dict, audio: Path, out_path: P
         on_progress(1)
 
 
-def _decode_clip(original: Path, row: dict, frames: int, sw: int, sh: int) -> list[np.ndarray]:
+def _iter_clip_frames(original: Path, row: dict, frames: int, sw: int, sh: int):
     if float(row["speed"]) <= 0.001:
-        one = _read_frames(original, float(row["sourceStart"]), float(row["sourceStart"]) + 0.08, 1, sw, sh)
-        return one * frames
-    return _read_frames(original, float(row["sourceStart"]), float(row["sourceEnd"]), frames, sw, sh)
+        held = None
+        for frame in _iter_frames(original, float(row["sourceStart"]), float(row["sourceStart"]) + 0.08, 1, sw, sh):
+            held = frame
+        if held is None:
+            held = np.zeros((sh, sw, 3), dtype=np.uint8)
+        for _ in range(frames):
+            yield held.copy()
+        return
+    yield from _iter_frames(original, float(row["sourceStart"]), float(row["sourceEnd"]), frames, sw, sh)
 
 
-def _read_frames(original: Path, start: float, end: float, count: int, sw: int, sh: int) -> list[np.ndarray]:
+def _iter_frames(original: Path, start: float, end: float, count: int, sw: int, sh: int):
     span = max(0.04, end - start)
     fps = count / span
     cmd = [
@@ -199,18 +310,24 @@ def _read_frames(original: Path, start: float, end: float, count: int, sw: int, 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.stdout is not None
     needed = sw * sh * 3
-    frames = []
-    for _ in range(count):
-        raw = proc.stdout.read(needed)
-        if len(raw) < needed:
-            break
-        frames.append(np.frombuffer(raw, dtype=np.uint8).reshape((sh, sw, 3)).copy())
-    proc.wait()
-    if not frames:
-        frames.append(np.zeros((sh, sw, 3), dtype=np.uint8))
-    while len(frames) < count:
-        frames.append(frames[-1])
-    return frames
+    produced = 0
+    last = None
+    try:
+        while produced < count:
+            raw = proc.stdout.read(needed)
+            if len(raw) < needed:
+                break
+            last = np.frombuffer(raw, dtype=np.uint8).reshape((sh, sw, 3)).copy()
+            yield last
+            produced += 1
+    finally:
+        proc.stdout.close()
+        proc.wait()
+    if last is None:
+        last = np.zeros((sh, sw, 3), dtype=np.uint8)
+    while produced < count:
+        yield last.copy()
+        produced += 1
 
 
 def _focus_point(analysis: dict, row: dict, src_t: float) -> tuple[float, float]:
@@ -242,9 +359,10 @@ def _face_at(analysis: dict | None, track_id: str | None, src_t: float) -> dict 
 def _crop(frame: np.ndarray, fx: float, fy: float, zoom: float) -> tuple[np.ndarray, tuple[float, float, float, float]]:
     import cv2
 
+    canvas = _canvas()
     sh, sw = frame.shape[:2]
     zoom = min(2.4, max(1.0, zoom))
-    target = OUT_W / OUT_H
+    target = canvas.w / canvas.h
     if sw / sh > target:
         vis_h = sh / zoom
         vis_w = vis_h * target
@@ -258,22 +376,23 @@ def _crop(frame: np.ndarray, fx: float, fy: float, zoom: float) -> tuple[np.ndar
     crop = frame[int(y0) : max(int(y0) + 1, int(y1)), int(x0) : max(int(x0) + 1, int(x1))]
     if crop.size == 0:
         crop = frame
-    resized = cv2.resize(crop, (OUT_W, OUT_H), interpolation=cv2.INTER_AREA if zoom <= 1.05 else cv2.INTER_LINEAR)
+    resized = cv2.resize(crop, (canvas.w, canvas.h), interpolation=cv2.INTER_AREA if zoom <= 1.05 else cv2.INTER_LINEAR)
     return resized, (x0, y0, vis_w, vis_h)
 
 
 def _project_faces(analysis: dict, src_t: float, window, sw: int, sh: int) -> list[dict]:
+    canvas = _canvas()
     x0, y0, vw, vh = window
     faces = []
     for track in analysis.get("faces") or []:
         box = _face_at(analysis, track["id"], src_t)
         if not box:
             continue
-        ox = (box["x"] * sw - x0) / vw * OUT_W
-        oy = (box["y"] * sh - y0) / vh * OUT_H
-        ow = box["w"] * sw / vw * OUT_W
-        oh = box["h"] * sh / vh * OUT_H
-        if ow < 12 or oh < 12 or ox > OUT_W or oy > OUT_H or ox + ow < 0 or oy + oh < 0:
+        ox = (box["x"] * sw - x0) / vw * canvas.w
+        oy = (box["y"] * sh - y0) / vh * canvas.h
+        ow = box["w"] * sw / vw * canvas.w
+        oh = box["h"] * sh / vh * canvas.h
+        if ow < 12 or oh < 12 or ox > canvas.w or oy > canvas.h or ox + ow < 0 or oy + oh < 0:
             continue
         faces.append({"id": track["id"], "x": ox, "y": oy, "w": ow, "h": oh})
     return faces
@@ -299,7 +418,7 @@ def _composite(image: np.ndarray, plan: dict, out_t: float, faces: list[dict], c
             sprite = _caption_sprite(caption, cache)
             local = out_t - float(caption["start"])
             sprite = gfx.scale_sprite(sprite, gfx.pop_scale(local) if local < 0.18 else 1)
-            x, y = _avoid(sprite, faces, prefer_y=int(OUT_H * 0.72))
+            x, y = _avoid(sprite, faces, prefer_y=int(_canvas().h * 0.72))
             gfx.blit(image, sprite, x, y)
 
 
@@ -307,20 +426,21 @@ def _effect_sprite(effect: dict, cache: dict):
     key = (effect["id"], effect["type"], effect.get("text"), effect.get("emoji"), effect.get("fontSize"), effect.get("kind"))
     if key in cache:
         return cache[key]
+    factor = _canvas().factor
     if effect["type"] == "text":
         kind = effect.get("kind") or "headline"
         if kind == "story":
-            sprite = gfx.story_sprite(effect["text"], int(effect.get("fontSize") or 64))
+            sprite = gfx.story_sprite(effect["text"], max(1, int(round(int(effect.get("fontSize") or 64) * factor))))
         elif kind == "bubble":
-            sprite = gfx.bubble_sprite(effect["text"], int(effect.get("fontSize") or 48))
+            sprite = gfx.bubble_sprite(effect["text"], max(1, int(round(int(effect.get("fontSize") or 48) * factor))))
         else:
-            sprite = gfx.headline_sprite(effect["text"], effect.get("accent"), int(effect.get("fontSize") or 120))
+            sprite = gfx.headline_sprite(effect["text"], effect.get("accent"), max(1, int(round(int(effect.get("fontSize") or 120) * factor))))
     elif effect["type"] == "emoji":
-        sprite = gfx.emoji_sprite(effect["emoji"], 150)
+        sprite = gfx.emoji_sprite(effect["emoji"], max(1, int(round(150 * factor))))
     elif effect["type"] == "arrow":
-        sprite = gfx.arrow_sprite().rotate(90, expand=True, resample=Image.Resampling.BICUBIC)
+        sprite = gfx.arrow_sprite(max(1, int(round(210 * factor)))).rotate(90, expand=True, resample=Image.Resampling.BICUBIC)
     elif effect["type"] == "circle":
-        sprite = gfx.circle_sprite(100)
+        sprite = gfx.circle_sprite(max(1, int(round(100 * factor))))
     else:
         sprite = gfx.badge_sprite(effect.get("text") or "")
     cache[key] = sprite
@@ -330,20 +450,23 @@ def _effect_sprite(effect: dict, cache: dict):
 def _caption_sprite(caption: dict, cache: dict):
     key = ("cap", caption["id"], caption["text"], caption.get("accent"), caption.get("fontSize"))
     if key not in cache:
-        sprites = gfx.caption_sprites(caption["text"], caption.get("accent") or "", int(caption.get("fontSize") or 72))
+        size = max(1, int(round(int(caption.get("fontSize") or 72) * _canvas().factor)))
+        sprites = gfx.caption_sprites(caption["text"], caption.get("accent") or "", size)
         cache[key] = gfx._row(sprites, gap=16)
     return cache[key]
 
 
 def _anchor(effect: dict, sprite: Image.Image, faces: list[dict]) -> tuple[int, int]:
+    canvas = _canvas()
+    factor = canvas.factor
     face = _match_face(effect.get("track"), faces)
     anchor = effect.get("anchor") or "above"
     if effect["type"] == "text" and effect.get("kind") == "headline":
-        return _avoid(sprite, faces, prefer_y=262)
+        return _avoid(sprite, faces, prefer_y=int(round(262 * factor)))
     if effect["type"] == "text" and effect.get("kind") == "story":
-        return _avoid(sprite, faces, prefer_y=520)
+        return _avoid(sprite, faces, prefer_y=int(round(520 * factor)))
     if effect["type"] == "badge":
-        return _avoid(sprite, faces, prefer_y=240)
+        return _avoid(sprite, faces, prefer_y=int(round(240 * factor)))
     if face is None:
         return _avoid(sprite, faces, prefer_y=300)
     if effect["type"] == "circle":
@@ -362,8 +485,8 @@ def _anchor(effect: dict, sprite: Image.Image, faces: list[dict]) -> tuple[int, 
     else:
         x = int(face["x"] + face["w"] / 2 - sprite.width / 2)
         y = int(face["y"] - sprite.height - 24)
-    x = int(min(max(x, SAFE_SIDE), OUT_W - SAFE_SIDE - sprite.width))
-    y = int(min(max(y, SAFE_TOP), OUT_H - SAFE_BOTTOM - sprite.height))
+    x = int(min(max(x, canvas.safe_side), canvas.w - canvas.safe_side - sprite.width))
+    y = int(min(max(y, canvas.safe_top), canvas.h - canvas.safe_bottom - sprite.height))
     return x, y
 
 
@@ -384,12 +507,14 @@ def _overlap(ax, ay, aw, ah, bx, by, bw, bh) -> float:
 
 
 def _avoid(sprite: Image.Image, faces: list[dict], prefer_y: int) -> tuple[int, int]:
-    x = int((OUT_W - sprite.width) / 2)
-    x = int(min(max(x, SAFE_SIDE), max(SAFE_SIDE, OUT_W - SAFE_SIDE - sprite.width)))
-    candidates = [prefer_y, 280, 460, 700, 980, 1280, 1480]
+    canvas = _canvas()
+    factor = canvas.factor
+    x = int((canvas.w - sprite.width) / 2)
+    x = int(min(max(x, canvas.safe_side), max(canvas.safe_side, canvas.w - canvas.safe_side - sprite.width)))
+    candidates = [prefer_y] + [int(round(y * factor)) for y in (280, 460, 700, 980, 1280, 1480)]
     best = None
     for y in candidates:
-        y = int(min(max(y, SAFE_TOP), OUT_H - SAFE_BOTTOM - sprite.height))
+        y = int(min(max(y, canvas.safe_top), canvas.h - canvas.safe_bottom - sprite.height))
         hit = sum(_overlap(x, y, sprite.width, sprite.height, f["x"], f["y"], f["w"], f["h"]) for f in faces)
         # Prefer the requested lane when nothing collides.
         score = hit + abs(y - prefer_y) * 0.01
@@ -415,7 +540,20 @@ def _inspect(path: Path) -> dict:
         "channels": int(audio["channels"]) if audio and audio.get("channels") else 0,
         "duration": float(data["format"]["duration"]),
         "loudness": loudness,
+        "fps": _rate(video.get("avg_frame_rate")),
     }
+
+
+def _rate(rate: str | None) -> float:
+    text = str(rate or "0/1")
+    if "/" in text:
+        num, den = text.split("/", 1)
+        den_f = float(den or 1)
+        return float(num) / den_f if den_f else 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
 
 
 def _loudness(path: Path) -> float | None:

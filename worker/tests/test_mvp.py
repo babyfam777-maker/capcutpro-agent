@@ -1,7 +1,7 @@
 """Storyboard and plan checks. No clip-specific names or source times."""
 
 from app.mvp import build_storyboard, plan_from_storyboard
-from app.plan_ops import min_readable_seconds
+from app.plan_ops import min_readable_seconds, timeline
 
 
 def _analysis() -> dict:
@@ -54,6 +54,8 @@ def test_supported_phrase_stays_whole_and_rejected_text_stays_out(monkeypatch):
     assert story["end"] - story["start"] + 1e-6 >= min_readable_seconds(story["text"])
     assert any(effect["type"] == "sound_effect" and effect["sfx"] == "impact" for effect in plan["effects"])
     assert not any(effect.get("sfx") == "airhorn" for effect in plan["effects"])
+    _, total = timeline(plan)
+    assert total >= 13
 
 
 def test_rejected_speech_still_builds_a_visual_short(monkeypatch):
@@ -70,7 +72,11 @@ def test_rejected_speech_still_builds_a_visual_short(monkeypatch):
     texts = " ".join(effect.get("text") or "" for effect in plan["effects"])
     assert "invented" not in texts.lower()
     assert any(effect.get("kind") == "headline" for effect in plan["effects"])
-    assert not any(clip["label"] == "replay" for clip in plan["clips"])
+    _, total = timeline(plan)
+    assert total >= 13
+    for clip in plan["clips"]:
+        assert float(clip["sourceStart"]) >= -0.02
+        assert float(clip["sourceEnd"]) <= float(doc["source"]["duration"]) + 0.05
 
 
 def test_speed_rounding_cannot_make_a_phrase_unreadable(monkeypatch):

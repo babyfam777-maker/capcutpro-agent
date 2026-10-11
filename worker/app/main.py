@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from .agent import run_turn
 from .config import MODEL, OPENAI_BASE_URL, WORKER_TOKEN
 from .ffmpeg_util import run
+from .shorts import render_again, render_first_short
 from .store import Project, store
 
 app = FastAPI(title="CapCutPro worker")
@@ -61,22 +62,42 @@ def get_project(project_id: str):
     return _project(project_id).public()
 
 
+@app.post("/projects/{project_id}/short")
+def post_short(project_id: str, body: dict):
+    project = _project(project_id)
+    prompt = str(body.get("prompt") or body.get("text") or "")
+    return _sse(project, lambda on_event: render_first_short(project, prompt, on_event))
+
+
+@app.post("/projects/{project_id}/rerender")
+def post_rerender(project_id: str, body: dict):
+    project = _project(project_id)
+    lines = body.get("lines")
+    if isinstance(lines, str):
+        lines = [lines]
+    if not isinstance(lines, list):
+        lines = [str(body.get("text") or "")]
+    return _sse(project, lambda on_event: render_again(project, [str(line) for line in lines], on_event))
+
+
 @app.post("/projects/{project_id}/messages")
 def post_message(project_id: str, body: dict):
     project = _project(project_id)
     text = str(body.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "Text saknas.")
-    if not project.busy:
-        project.busy = True
-    else:
-        raise HTTPException(409, "En redigering pågår redan för den här videon.")
+    return _sse(project, lambda on_event: run_turn(project, text, on_event))
 
+
+def _sse(project: Project, work_fn):
+    if project.busy:
+        raise HTTPException(409, "En redigering pågår redan för den här videon.")
+    project.busy = True
     events: queue.Queue = queue.Queue()
 
     def work():
         try:
-            run_turn(project, text, lambda event, data: events.put((event, data)))
+            work_fn(lambda event, data: events.put((event, data)))
         except Exception as error:
             events.put(("error", {"message": str(error)}))
         finally:
