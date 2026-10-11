@@ -77,6 +77,7 @@ SAMPLE_FPS = 8
 
 _FACE_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
 _HAND_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+_POSE_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 _YAMNET_URL = "https://huggingface.co/audiomagic/yamnet-onnx/resolve/main/yamnet.onnx"
 _YAMNET_MAP_URL = "https://huggingface.co/audiomagic/yamnet-onnx/resolve/main/yamnet_class_map.csv"
 _YAMNET_INDEX = {"speech": 0, "scream": 11, "laughter": 13, "singing": 24, "applause": 62, "music": 132}
@@ -118,6 +119,18 @@ def build_video_analysis(path: Path, sha256: str | None = None, on_step=None) ->
     scenes = timed("scenes", lambda: _scenes(path, duration, unavailable))
     motion_series, motion_evidence = timed("motion", lambda: _motion(path, meta, unavailable))
     face_tracks, face_events = timed("faces", lambda: _faces(path, meta, unavailable))
+    haar_used = False
+    if not face_tracks:
+        haar_tracks = timed("faces_opencv", lambda: _faces_opencv(path, meta, unavailable))
+        if haar_tracks:
+            haar_used = True
+            face_tracks = haar_tracks
+            face_events = [_haar_face_event(track) for track in haar_tracks]
+    pose_used = False
+    pose_tracks: list[dict] = []
+    if not face_tracks:
+        pose_tracks = timed("pose", lambda: _poses(path, meta, unavailable))
+        pose_used = bool(pose_tracks)
     hand_tracks, hand_events = timed("hands", lambda: _hands(path, meta, face_tracks, unavailable))
     raw = timed("whisper", lambda: _read_transcript(path, bool(meta.get("hasAudio")), unavailable))
     prepared: dict = {}
@@ -232,6 +245,7 @@ def build_video_analysis(path: Path, sha256: str | None = None, on_step=None) ->
         row.pop("words", None)
 
     tracks = [_export_track(track, "face") for track in face_tracks]
+    tracks += [_export_track(track, "person") for track in pose_tracks]
     tracks += [_export_track(track, "hand") for track in hand_tracks]
     doc = {
         "version": 2,
@@ -248,7 +262,7 @@ def build_video_analysis(path: Path, sha256: str | None = None, on_step=None) ->
         "evidence": evidence,
         "phrases": phrase_docs,
         "transcript": transcript,
-        "limitations": list(FACE_HAND_LIMITATIONS),
+        "limitations": _limitations(haar_used, pose_used),
         "motion": motion_series,
         "audioBins": bins,
         "unavailable": unavailable,
@@ -783,6 +797,97 @@ def _motion(path: Path, meta: dict, unavailable: list[dict]) -> tuple[list[dict]
     return series, evidence
 
 
+def _limitations(haar_used: bool, pose_used: bool = False) -> list[str]:
+    limits = list(FACE_HAND_LIMITATIONS)
+    if haar_used:
+        limits.append(
+            "MediaPipe hittade inga ansikten, så rutorna kommer från OpenCV Haar. "
+            "Haar följer inte händer, profil eller leende. En pil kan följa en ansiktsruta när den finns."
+        )
+    if pose_used:
+        limits.append(
+            "Inget ansikte hittades. Huvudmotivet är en kroppsruta från MediaPipe Pose, inte ett ansikte."
+        )
+    return limits
+
+
+def _haar_face_event(track: dict) -> dict:
+    return {
+        "type": "face_track",
+        "t0": round(float(track["samples"][0]["t"]), 3),
+        "t1": round(float(track["samples"][-1]["t"]) + 1 / SAMPLE_FPS, 3),
+        "trackId": track["id"],
+        "confidence": 0.45,
+        "source": "opencv_haar",
+        "payload": {},
+    }
+
+
+def _faces_opencv(path: Path, meta: dict, unavailable: list[dict]) -> list[dict]:
+    """Frontal-face boxes when MediaPipe is missing or returns nothing. Not a smile or a hand."""
+    try:
+        import cv2
+    except Exception as error:
+        _unavailable(unavailable, "opencv_haar", error)
+        return []
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    if cascade.empty():
+        _unavailable(unavailable, "opencv_haar", "Haar-kaskaden saknas.")
+        return []
+    width, height = _proxy_size(meta, max_side=480)
+    detections: list[tuple[float, list[dict]]] = []
+    try:
+        index = 0
+        for frame in _frames(path, SAMPLE_FPS, width, height):
+            moment = index / SAMPLE_FPS
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            rects = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(28, 28))
+            boxes = []
+            for x, y, w, h in rects:
+                boxes.append({"bbox": [x / width, y / height, w / width, h / height]})
+            detections.append((moment, boxes))
+            index += 1
+    except Exception as error:
+        _unavailable(unavailable, "opencv_haar", error)
+        return []
+    return _link(detections, "f")
+
+
+def _poses(path: Path, meta: dict, unavailable: list[dict]) -> list[dict]:
+    """Body boxes when no face was found. A pose box is not a face and not an identity."""
+    loaded = _landmarker("pose", unavailable)
+    if loaded is None:
+        return []
+    mp, landmarker = loaded
+    width, height = _proxy_size(meta, max_side=480)
+    detections: list[tuple[float, list[dict]]] = []
+    try:
+        index = 0
+        for frame in _frames(path, SAMPLE_FPS, width, height):
+            moment = index / SAMPLE_FPS
+            result = landmarker.detect_for_video(_mp_image(mp, frame), int(round(moment * 1000)) + index)
+            boxes = []
+            for landmarks in result.pose_landmarks or []:
+                visible = [point for point in landmarks if getattr(point, "visibility", 0) >= 0.4]
+                if len(visible) < 6:
+                    continue
+                xs = [float(point.x) for point in visible]
+                ys = [float(point.y) for point in visible]
+                x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+                boxes.append({"bbox": [
+                    max(0.0, x0), max(0.0, y0),
+                    min(1.0, x1) - max(0.0, x0), min(1.0, y1) - max(0.0, y0),
+                ]})
+            detections.append((moment, boxes))
+            index += 1
+    except Exception as error:
+        _unavailable(unavailable, "mediapipe_pose", error)
+        return []
+    finally:
+        _close(landmarker)
+    return _link(detections, "p")
+
+
 def _faces(path: Path, meta: dict, unavailable: list[dict]):
     """Face tracks only. Darkness, profile, and distance are often missed; that miss is not a fact."""
     loaded = _landmarker("face", unavailable)
@@ -1132,14 +1237,18 @@ def _landmarker(kind: str, unavailable: list[dict]):
         _unavailable(unavailable, f"mediapipe_{kind}", "mediapipe är inte installerat.")
         return None
     mp, vision, base = imported
-    url = _FACE_URL if kind == "face" else _HAND_URL
-    filename = "face_landmarker.task" if kind == "face" else "hand_landmarker.task"
+    urls = {"face": (_FACE_URL, "face_landmarker.task"), "hand": (_HAND_URL, "hand_landmarker.task"), "pose": (_POSE_URL, "pose_landmarker_lite.task")}
+    url, filename = urls[kind]
     model = _ensure_model(filename, url)
     if model is None:
         _unavailable(unavailable, f"mediapipe_{kind}", "Modellen kunde inte hämtas.")
         return None
-    options_cls = vision.FaceLandmarkerOptions if kind == "face" else vision.HandLandmarkerOptions
-    maker = vision.FaceLandmarker if kind == "face" else vision.HandLandmarker
+    makers = {
+        "face": (vision.FaceLandmarkerOptions, vision.FaceLandmarker),
+        "hand": (vision.HandLandmarkerOptions, vision.HandLandmarker),
+        "pose": (vision.PoseLandmarkerOptions, vision.PoseLandmarker),
+    }
+    options_cls, maker = makers[kind]
     kwargs = {
         "base_options": base.BaseOptions(model_asset_path=str(model)),
         "running_mode": vision.RunningMode.VIDEO,
@@ -1147,8 +1256,10 @@ def _landmarker(kind: str, unavailable: list[dict]):
     if kind == "face":
         kwargs["num_faces"] = 4
         kwargs["output_face_blendshapes"] = True
-    else:
+    elif kind == "hand":
         kwargs["num_hands"] = 2
+    else:
+        kwargs["num_poses"] = 1
     try:
         return mp, maker.create_from_options(options_cls(**kwargs))
     except Exception as error:

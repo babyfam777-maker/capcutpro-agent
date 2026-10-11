@@ -1,13 +1,18 @@
-"""First short and chat re-render. Both go through the existing render_plan."""
+"""First short and chat re-render.
+
+The chat decides the timeline. Rendering still goes through render_plan.
+Phone delivery is 1080x1920. Set SHORT_DELIVERY=4k for the labeled upscale.
+"""
 
 from __future__ import annotations
 
 import copy
 
-from .export_spec import SHORT_EXPORT
-from .mvp import build_storyboard, plan_from_storyboard, qa_output, renderer_view
+from .config import SHORT_DELIVERY
+from .creative import revise, track_view
+from .export_spec import SHORT_EXPORT, describe_export
+from .ffmpeg_util import probe
 from .render import render_plan
-from .revisions import apply_edits
 
 
 def render_first_short(project, prompt: str, on_event) -> dict:
@@ -17,13 +22,204 @@ def render_first_short(project, prompt: str, on_event) -> dict:
     project.messages.append({"role": "user", "content": prompt})
     project.save_messages()
     on_event("status", {"step": "analyze"})
-
-    def step(name: str) -> None:
-        on_event("status", {"step": name})
-
-    found = project.analyze_v2(on_step=step)
+    found = project.analyze_v2(on_step=lambda name: on_event("status", {"step": name}))
     if not found.get("ok"):
         raise RuntimeError(found.get("error") or "Analysen misslyckades.")
+    analysis = found["analysis"]
+    _emit_analysis(on_event, found)
+    on_event("status", {"step": "storyboard"})
+    edited = revise(analysis, None, prompt, first=True)
+    if not edited.get("ok"):
+        raise RuntimeError(edited.get("error") or "Planen kunde inte byggas.")
+    return _commit(project, analysis, edited, on_event, prompt)
+
+
+def render_again(project, lines: list[str], on_event) -> dict:
+    cleaned = [" ".join(str(line).split()) for line in lines if str(line).strip()]
+    if not cleaned:
+        raise RuntimeError("Skriv vad som ska ändras.")
+    if not project.render_view or not (project.editor.plan.get("clips") or project.editor.versions):
+        raise RuntimeError("Gör en short först.")
+    analysis = _read_analysis(project)
+    if not analysis:
+        raise RuntimeError("Analysen saknas. Gör om shortsen från början, originalfilen ligger kvar.")
+    plan = copy.deepcopy(project.editor.plan)
+    stack = [copy.deepcopy(item["plan"]) for item in project.editor.versions]
+    if not stack:
+        stack = [copy.deepcopy(plan)]
+    changes: list[str] = []
+    backend = "rules"
+    model_note = None
+    for line in cleaned:
+        project.messages.append({"role": "user", "content": line})
+        edited = revise(analysis, plan, line, first=False)
+        if edited.get("undo"):
+            if len(stack) < 2:
+                raise RuntimeError("Det finns ingen tidigare version att ångra. Originalfilen och den här planen ligger kvar.")
+            stack.pop()
+            plan = copy.deepcopy(stack[-1])
+            changes.append("Senaste ändringen är ångrad. Tidslinjen är den föregående versionens plan, och den renderas igen.")
+            backend = "rules"
+            continue
+        if not edited.get("ok"):
+            project.save_messages()
+            raise RuntimeError(edited.get("error") or "Ändringen stoppades.")
+        plan = edited["plan"]
+        stack.append(copy.deepcopy(plan))
+        changes.extend(edited.get("changes") or [])
+        backend = edited.get("backend") or backend
+        model_note = edited.get("modelNote") or model_note
+    project.save_messages()
+    on_event("edits", {"changes": changes, "skipped": []})
+    edited = {"ok": True, "plan": plan, "changes": changes, "backend": backend, "modelNote": model_note}
+    return _commit(project, analysis, edited, on_event, " ".join(cleaned))
+
+
+def _commit(project, analysis: dict, edited: dict, on_event, instruction: str) -> dict:
+    plan = edited["plan"]
+    plan.setdefault("decision", {})
+    plan["decision"]["backend"] = edited.get("backend")
+    plan["decision"]["instruction"] = instruction
+    plan["audio"]["music"] = bool(plan.get("audio", {}).get("music"))
+    if plan["audio"]["music"]:
+        raise RuntimeError("Planen ville lägga på musik. Det görs inte utan en uttrycklig begäran, och ingen fil skrevs.")
+    view = track_view(analysis)
+    project.set_render_view(view)
+    _write_timeline(project, plan, edited)
+    previous = copy.deepcopy(project.editor.plan)
+    try:
+        saved = _render(project, plan, view, analysis, on_event)
+    except Exception:
+        project.editor.plan = previous
+        project.save()
+        raise
+    reply = _reply(saved, edited)
+    project.messages.append({
+        "role": "assistant",
+        "content": reply,
+        "trace": [{"name": edited.get("backend") or "edit", "ok": True}],
+    })
+    project.save_messages()
+    on_event("version", {"activeVersion": saved["version"]})
+    on_event("done", {
+        "reply": reply,
+        "activeVersion": saved["version"],
+        "videoUrl": saved["videoUrl"],
+        "probe": saved.get("probe"),
+        "qa": saved.get("qa"),
+        "changes": edited.get("changes") or [],
+        "skipped": [],
+        "backend": edited.get("backend"),
+        "hook": "",
+    })
+    return saved
+
+
+def _render(project, plan: dict, view: dict, analysis: dict, on_event) -> dict:
+    on_event("status", {"step": "render"})
+    version, folder = project.next_version_folder()
+    out = folder / "output.mp4"
+    delivery = SHORT_EXPORT if SHORT_DELIVERY in {"4k", "4k60", "short"} else None
+    if delivery:
+        plan.setdefault("export", {}).update(describe_export(analysis.get("source") or {}, delivery))
+    probe_info = render_plan(
+        project.original,
+        view,
+        plan,
+        out,
+        on_progress=lambda progress: on_event("progress", {"progress": round(progress, 3)}),
+        delivery=delivery,
+    )
+    on_event("status", {"step": "qa"})
+    qa = _qa(out, plan, analysis, delivery)
+    on_event("qa", qa)
+    if not qa.get("playable"):
+        raise RuntimeError("Filen är inte en spelbar MP4. " + " ".join(
+            item["detail"] for item in qa.get("checks") or [] if not item.get("ok")
+        ))
+    saved = project.save_version(version, plan, probe_info, qa)
+    saved["plan"] = plan
+    return saved
+
+
+def _qa(path, plan: dict, analysis: dict, delivery: dict | None) -> dict:
+    data = probe(path)
+    video = next((stream for stream in data.get("streams") or [] if stream.get("codec_type") == "video"), {})
+    audio = next((stream for stream in data.get("streams") or [] if stream.get("codec_type") == "audio"), {})
+    duration = float((data.get("format") or {}).get("duration") or 0)
+    width = int(video.get("width") or 0)
+    height = int(video.get("height") or 0)
+    profile = str(video.get("profile") or "")
+    rate = str(video.get("avg_frame_rate") or "0/1")
+    checks = []
+
+    def check(name: str, ok: bool, detail: str) -> None:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    check("duration", duration > 0.4, f"{duration:.3f}s")
+    if delivery:
+        spec = describe_export((analysis or {}).get("source") or {}, delivery)
+        check("resolution", width == spec["width"] and height == spec["height"], f"{width}x{height}")
+        comment = str(((data.get("format") or {}).get("tags") or {}).get("comment") or "")
+        check("quality_label", comment == spec["quality"], comment or "saknas")
+    else:
+        check("resolution", width == 1080 and height == 1920, f"{width}x{height}")
+        check("not_advertised_4k", width < 2160, f"{width}x{height}")
+    ratio = (width / height) if height else 0
+    check("vertical", abs(ratio - 9 / 16) < 0.02, f"{ratio:.4f}")
+    check(
+        "codec",
+        video.get("codec_name") == "h264" and "high" in profile.lower() and video.get("pix_fmt") == "yuv420p" and audio.get("codec_name") == "aac",
+        f"{video.get('codec_name')} {profile} {video.get('pix_fmt')}/{audio.get('codec_name')}",
+    )
+    check("fps", _fps(rate) > 1, rate)
+    check("audio", bool(audio), "ljudspår finns" if audio else "ljudspår saknas")
+    check(
+        "original_audio",
+        plan.get("audio", {}).get("keepOriginal") is True and plan.get("audio", {}).get("music") is False,
+        "keepOriginal, ingen musik",
+    )
+    blob = path.read_bytes()[: 4_000_000]
+    moov, mdat = blob.find(b"moov"), blob.find(b"mdat")
+    check("faststart", moov >= 0 and (mdat < 0 or moov < mdat), f"moov={moov} mdat={mdat}")
+    playable = all(item["ok"] for item in checks if item["name"] in {"duration", "codec", "resolution", "audio", "vertical"})
+    return {"ok": all(item["ok"] for item in checks), "playable": playable, "checks": checks, "duration": round(duration, 3)}
+
+
+def _fps(rate: str) -> float:
+    if "/" not in rate:
+        try:
+            return float(rate)
+        except ValueError:
+            return 0
+    num, den = rate.split("/", 1)
+    try:
+        return float(num) / float(den or 1)
+    except ValueError:
+        return 0
+
+
+def _reply(saved: dict, edited: dict) -> str:
+    probe_info = saved.get("probe") or {}
+    quality = probe_info.get("quality")
+    size = f"{probe_info.get('width')}x{probe_info.get('height')}"
+    if quality and quality != "native":
+        size += f", {quality}"
+    elif not quality:
+        size += ", 1080p"
+    lines = [
+        f"v{saved['version']} är klar ({float(probe_info.get('duration') or 0):.1f}s, {size}).",
+        " ".join(edited.get("changes") or []),
+    ]
+    note = edited.get("modelNote")
+    if edited.get("backend") == "ollama":
+        lines.append("Instruktionen tolkades av den lokala Ollama-modellen. Ingen betald tjänst anropades.")
+    elif note and "Regelmotorn" not in " ".join(edited.get("changes") or []):
+        lines.append(str(note))
+    return " ".join(line for line in lines if line).strip()
+
+
+def _emit_analysis(on_event, found: dict) -> None:
     analysis = found["analysis"]
     phrases = [row for row in analysis.get("phrases") or [] if row.get("status", "SUPPORTED") == "SUPPORTED"]
     on_event("analysis", {
@@ -34,153 +230,23 @@ def render_first_short(project, prompt: str, on_event) -> dict:
         "fps": (analysis.get("source") or {}).get("fps"),
         "phrases": len(phrases),
         "faces": len([track for track in analysis.get("tracks") or [] if track.get("kind") == "face"]),
+        "hands": len([track for track in analysis.get("tracks") or [] if track.get("kind") == "hand"]),
         "scenes": len(analysis.get("scenes") or []),
         "rejected": len([row for row in analysis.get("transcript") or [] if row.get("status") != "SUPPORTED"]),
+        "unavailable": [item.get("step") for item in analysis.get("unavailable") or []],
     })
-    on_event("status", {"step": "storyboard"})
-    board = build_storyboard(analysis, prompt)
-    plan = plan_from_storyboard(board, analysis)
-    view = renderer_view(analysis)
-    project.set_render_view(view)
-    _write_storyboard(project, board)
-    previous = copy.deepcopy(project.editor.plan)
-    try:
-        saved = _render(project, plan, view, on_event)
-    except Exception:
-        project.editor.plan = previous
-        raise
-    return _finish(project, saved, board, on_event)
 
 
-def render_again(project, lines: list[str], on_event) -> dict:
-    cleaned = [" ".join(str(line).split()) for line in lines if str(line).strip()]
-    if not cleaned:
-        raise RuntimeError("Skriv vad som ska ändras, till exempel: Gör hooken större.")
-    if not project.render_view or not (project.editor.plan.get("clips") or project.editor.versions):
-        raise RuntimeError("Gör en short först.")
-    edited = apply_edits(project.editor.plan, cleaned)
-    on_event("edits", {"changes": edited["changes"], "skipped": edited["skipped"]})
-    if not edited["ok"]:
-        raise RuntimeError(edited["error"])
-    for line in cleaned:
-        project.messages.append({"role": "user", "content": line})
-    project.save_messages()
-    previous = copy.deepcopy(project.editor.plan)
-    try:
-        saved = _render(project, edited["plan"], project.render_view, on_event)
-    except Exception:
-        project.editor.plan = previous
-        raise
-    reply = f"v{saved['version']} är klar. " + " ".join(edited["changes"])
-    if edited["skipped"]:
-        reply += " Förstod inte: " + "; ".join(edited["skipped"]) + "."
-    quality = (saved.get("probe") or {}).get("quality")
-    if quality and quality != "native":
-        reply += f" Exporten är {quality}."
-    project.messages.append({
-        "role": "assistant",
-        "content": reply,
-        "trace": [{"name": change, "ok": True} for change in edited["changes"]],
-    })
-    project.save_messages()
-    on_event("version", {"activeVersion": saved["version"]})
-    on_event("done", {
-        "reply": reply,
-        "activeVersion": saved["version"],
-        "videoUrl": saved["videoUrl"],
-        "probe": saved.get("probe"),
-        "qa": saved.get("qa"),
-        "changes": edited["changes"],
-        "skipped": edited["skipped"],
-    })
-    return saved
-
-
-def _finish(project, saved: dict, board: dict, on_event) -> dict:
-    probe = saved.get("probe") or {}
-    hook = (board.get("fields") or {}).get("hook") or ""
-    quality = probe.get("quality") or (saved.get("plan") or {}).get("export", {}).get("quality") or ""
-    reply = (
-        f"v{saved['version']} är klar"
-        f" ({float(probe.get('duration') or 0):.1f}s, "
-        f"{probe.get('width')}x{probe.get('height')}"
-        f"{', ' + quality if quality else ''}). "
-        f"Hook: {hook}."
-    )
-    limit = ((board.get("length") or {}).get("reason")) or ""
-    if limit:
-        reply += " " + limit
-    elif board.get("limitations"):
-        reply += " " + str(board["limitations"][0])
-    project.messages.append({"role": "assistant", "content": reply, "trace": [{"name": "render_plan", "ok": True}]})
-    project.save_messages()
-    on_event("version", {"activeVersion": saved["version"]})
-    on_event("done", {
-        "reply": reply,
-        "activeVersion": saved["version"],
-        "videoUrl": saved["videoUrl"],
-        "probe": probe,
-        "qa": saved.get("qa"),
-        "hook": hook,
-        "beats": [
-            {
-                "role": beat.get("role"),
-                "sourceStart": beat.get("sourceStart"),
-                "sourceEnd": beat.get("sourceEnd"),
-                "speed": beat.get("speed"),
-                "why": beat.get("why"),
-            }
-            for beat in board.get("beats") or []
-        ],
-        "length": board.get("length"),
-    })
-    return saved
-
-
-def _render(project, plan: dict, view: dict, on_event) -> dict:
-    on_event("status", {"step": "render"})
-    version, folder = project.next_version_folder()
-    out = folder / "output.mp4"
-    probe = render_plan(
-        project.original,
-        view,
-        plan,
-        out,
-        on_progress=lambda progress: on_event("progress", {"progress": round(progress, 3)}),
-        delivery=SHORT_EXPORT,
-    )
-    on_event("status", {"step": "qa"})
-    qa = None
-    try:
-        analysis = _read_analysis(project)
-        qa = qa_output(out, plan, analysis or {"transcript": [], "source": {}})
-    except Exception as error:
-        qa = {"ok": False, "checks": [{"name": "qa", "ok": False, "detail": str(error)}]}
-    on_event("qa", qa)
-    saved = project.save_version(version, plan, probe, qa)
-    saved["plan"] = plan
-    return saved
-
-
-def _write_storyboard(project, board: dict) -> None:
+def _write_timeline(project, plan: dict, edited: dict) -> None:
     from .store import _write
 
-    _write(project.folder / "storyboard.json", {
-        "prompt": board.get("prompt"),
-        "fields": board.get("fields"),
-        "beats": [
-            {
-                "role": beat.get("role"),
-                "sourceStart": beat.get("sourceStart"),
-                "sourceEnd": beat.get("sourceEnd"),
-                "speed": beat.get("speed"),
-                "why": beat.get("why"),
-                "text": beat.get("text"),
-            }
-            for beat in board.get("beats") or []
-        ],
-        "length": board.get("length"),
-        "limitations": board.get("limitations") or [],
+    _write(project.folder / "timeline.json", {
+        "backend": edited.get("backend"),
+        "changes": edited.get("changes") or [],
+        "audio": plan.get("audio"),
+        "clips": plan.get("clips"),
+        "captions": plan.get("captions"),
+        "effects": plan.get("effects"),
     })
 
 

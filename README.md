@@ -50,6 +50,26 @@ Docker på Windows:
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Docker
 ```
 
+## Ingen betald tjänst
+
+Chatten på startsidan bestämmer tidslinjen. Den lägger inte längre in ordet LOOK, en badge eller en bubbla av sig själv. Originaljud är på och bakgrundsmusik är av, tills du ber om något annat.
+
+Språkmodellen är lokal Ollama (`qwen2.5:3b` som standard, `OPENAI_BASE_URL=http://127.0.0.1:11434/v1`). Ingen API-nyckel behövs. Om Ollama inte svarar används en regelmotor, och svaret säger det. Workern byter inte tyst till Gemini, OpenAI, Anthropic eller Grok. En annan OpenAI-kompatibel server används bara om du själv sätter `LLM_ALLOW_REMOTE=1`.
+
+Analys och render är lokala: FFmpeg, OpenCV, faster-whisper när paketet finns, och MediaPipe för ansikte, händer och pose. MediaPipe behöver `libegl1` och `libgl1`. Hittas inget ansikte används en kroppsruta från pose. En pil följer ett handspår bara om MediaPipe faktiskt hittade en hand. Saknas MediaPipe används OpenCV Haar, som ofta missar profil och mörka bilder.
+
+Standardfilen är 1080×1920, H.264 High, yuv420p, så den går att spela på en telefon. `SHORT_DELIVERY=4k` gör 2160×3840 i 60 bilder per sekund och märker filen `upscaled` när källan är mindre. Det tar betydligt längre tid på en fri CPU.
+
+Colab-anteckningen `colab/capcutpro_worker.ipynb` installerar FFmpeg och Ollama, startar workern på port 8787 och skriver ut `WORKER URL` via en Cloudflare-tunnel. Fri Colab har ungefär 12 GB RAM, bara CPU, och en session som kan dö. räkna med att qwen2.5:3b och Whisper base får plats, men inte en stor bildmodell och inte en snabb 4K60-render.
+
+Utan Colab, på din egen dator:
+
+```bash
+bash start.sh
+```
+
+Det startar Ollama om den är installerad, workern och sidan på [http://127.0.0.1:3000](http://127.0.0.1:3000). Docker: `bash start.sh --docker`.
+
 ## Byta AI-modell
 
 Workern pratar med vilket program som helst som har samma API som OpenAI. Standard är Ollama på den här datorn.
@@ -57,8 +77,10 @@ Workern pratar med vilket program som helst som har samma API som OpenAI. Standa
 | Variabel | Standard | Betydelse |
 |---|---|---|
 | `OPENAI_BASE_URL` | `http://127.0.0.1:11434/v1` | Adress till modellen |
-| `OPENAI_API_KEY` | `ollama` | Nyckel. Ollama bryr sig inte om värdet. |
-| `MODEL` | `qwen2.5:3b` | Modellnamn. En större modell, till exempel `qwen2.5:7b`, följer instruktioner bättre. |
+| `OPENAI_API_KEY` | `ollama` | Ollama ignorerar värdet. Ingen riktig nyckel behövs. |
+| `MODEL` | `qwen2.5:3b` | Lokal modell. En större modell följer instruktioner bättre och kräver mer minne. |
+| `LLM_ALLOW_REMOTE` | av | Måste vara `1` innan en adress som inte är localhost ens får anropas. |
+| `SHORT_DELIVERY` | `phone` | `4k` renderar 2160×3840 och märker uppskalning. |
 | `WORKER_URL` | `http://127.0.0.1:8787` | Adressen webbsidan använder till workern |
 | `WHISPER_MODEL` | `base` | Lokal tal-till-text. `small` är noggrannare och tyngre. |
 | `LLM_TIMEOUT` | `180` | Hur många sekunder workern väntar på ett svar från modellen. Höj om en långsam modell hinner inte svara. |
@@ -66,11 +88,13 @@ Workern pratar med vilket program som helst som har samma API som OpenAI. Standa
 Exempel med en annan server:
 
 ```bash
-export OPENAI_BASE_URL="https://din-server/v1"
-export OPENAI_API_KEY="hemlig-nyckel"
-export MODEL="namnet-på-modellen"
+export LLM_ALLOW_REMOTE=1
+export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
+export MODEL="qwen2.5:3b"
 bash start.sh
 ```
+
+Lämna `LLM_ALLOW_REMOTE` tom om servern är Ollama på den här datorn. Sätt den bara om du medvetet pekar på en annan dator du själv driver.
 
 ## Köra workern på en annan dator
 

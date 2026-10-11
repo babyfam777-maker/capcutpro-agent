@@ -9,9 +9,9 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from .agent import run_turn
 from .config import MODEL, OPENAI_BASE_URL, WORKER_TOKEN
 from .ffmpeg_util import run
+from .llm_local import health as llm_health
 from .shorts import render_again, render_first_short
 from .store import Project, store
 
@@ -39,7 +39,15 @@ def health():
         run(["ffmpeg", "-version"], "ffmpeg")
     except Exception:
         ffmpeg = False
-    return {"ok": ffmpeg, "ffmpeg": ffmpeg, "model": MODEL, "baseUrl": OPENAI_BASE_URL}
+    brain = llm_health()
+    return {
+        "ok": ffmpeg,
+        "ffmpeg": ffmpeg,
+        "model": MODEL,
+        "baseUrl": OPENAI_BASE_URL,
+        "paidProviders": False,
+        "llm": brain,
+    }
 
 
 @app.post("/projects")
@@ -86,7 +94,9 @@ def post_message(project_id: str, body: dict):
     text = str(body.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "Text saknas.")
-    return _sse(project, lambda on_event: run_turn(project, text, on_event))
+    if project.editor.plan.get("clips") or project.editor.versions:
+        return _sse(project, lambda on_event: render_again(project, [text], on_event))
+    return _sse(project, lambda on_event: render_first_short(project, text, on_event))
 
 
 def _sse(project: Project, work_fn):
