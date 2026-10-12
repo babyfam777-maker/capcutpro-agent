@@ -39,6 +39,12 @@ Allowed ops:
 {"op":"speed_opening","seconds":2,"speed":1.6}
 {"op":"red_accent"}
 {"op":"grow_opening"}
+{"op":"zoom_reaction","zoomEnd":1.38}
+{"op":"blur"}
+{"op":"freeze"}
+{"op":"speed_ramp"}
+{"op":"slow_down"}
+{"op":"satisfying_end"}
 {"op":"set_audio","keepOriginal":true,"music":false}
 Use only source times inside the video and only track ids from the analysis.
 Do not invent words, people, or reactions. Do not add music. Keep the original audio unless the user says to remove it.
@@ -164,7 +170,7 @@ def parse_intent(text: str) -> dict[str, Any]:
         "trim_open": _opening_seconds(folded),
         "zoom_main": _wants_zoom(folded),
         "remove_last_caption": bool(re.search(
-            r"(remove|ta bort|radera|tabort).{0,40}(last caption|sista text|sista undertext|sista caption)",
+            r"(remove|ta bort|radera|tabort).{0,40}(last caption|sista text|sista undertext|sista caption|den dar texten|that text|den texten)",
             folded,
         )),
         "remove_word": _remove_word(text, folded),
@@ -187,15 +193,35 @@ def parse_intent(text: str) -> dict[str, Any]:
         "keep_audio": bool(re.search(r"(keep the original|original audio|original dialogue|behall .{0,12}ljud|behall .{0,16}dialog)", folded)),
         "no_music": bool(re.search(r"(no music|ingen musik|utan musik|do not add background|don't add background|inte .{0,12}musik)", folded)),
         "funnier": bool(re.search(r"(roligare|funnier|rolig text|texten roligare)", folded)),
+        "zoom_reaction": bool(re.search(r"\b(zoom|zooma)\b", folded) and re.search(r"reaktion|reaction", folded)),
+        "blur": bool(re.search(r"\b(blur|oskarpa|sudda)\b", folded)),
+        "freeze": bool(re.search(r"(freeze|frysruta|frys bild|frysrutan)", folded)),
+        "speed_ramp": bool(re.search(r"(speed ramp|tempo ramp|tempoökning|tempookning|oka tempot gradvis|ramp)", folded)),
+        "slower": bool(re.search(r"(for snabbt|too fast|langsamare|slower|sakta ner)", folded)),
+        "captions_bigger": bool(re.search(r"(storre|bigger|larger)", folded) and re.search(r"(caption|undertext)", folded)),
+        "satisfying_end": bool(re.search(r"(slutet|ending).{0,30}(satisf|nojd)", folded) or re.search(r"(mer satisfying|more satisfying)", folded)),
+        "more_viral": bool(re.search(r"(mer viral|more viral|gor den viral|make it viral)", folded)),
+        "arrow_person": _arrow_person(folded),
     }
+    boring = _boring_open(folded)
+    if boring and intent["trim_open"] is None:
+        intent["trim_open"] = boring
     if intent["add_hand_arrow"]:
         intent["remove_kind"] = None
-    intent["any_edit"] = any([
-        intent["redo"], intent["trim_open"], intent["zoom_main"], intent["remove_last_caption"],
-        intent["remove_word"], intent["remove_kind"], intent["add_hand_arrow"], intent["zoom_touch"],
-        intent["start_reaction"], intent["speed_open"], intent["red_text"], intent["grow_opening"],
-        intent["mute"], intent["want_music"], intent["keep_audio"], intent["no_music"], intent["funnier"],
-    ])
+        intent["arrow_person"] = False
+    if intent["zoom_reaction"]:
+        intent["zoom_main"] = False
+        intent["start_reaction"] = False
+    if intent["captions_bigger"]:
+        intent["grow_opening"] = False
+    intent["any_edit"] = any(
+        intent[key] for key in (
+            "redo", "trim_open", "zoom_main", "remove_last_caption", "remove_word", "remove_kind",
+            "add_hand_arrow", "zoom_touch", "start_reaction", "speed_open", "red_text", "grow_opening",
+            "mute", "want_music", "keep_audio", "no_music", "funnier", "zoom_reaction", "blur", "freeze",
+            "speed_ramp", "slower", "captions_bigger", "satisfying_end", "more_viral", "arrow_person",
+        )
+    )
     return intent
 
 
@@ -270,6 +296,25 @@ def _remove_kind(folded: str) -> str | None:
     return None
 
 
+def _boring_open(folded: str) -> float | None:
+    if not re.search(r"(trakig|boring|dead|tomgang)", folded):
+        return None
+    match = re.search(r"(forsta|first|opening).{0,16}(\d+(?:[.,]\d+)?|tva|two|tre|three)", folded)
+    if not match:
+        return 2.0
+    token = match.group(2).replace(",", ".")
+    return float(_NUMBERS.get(token, token))
+
+
+def _arrow_person(folded: str) -> bool:
+    adding = bool(re.search(r"(lagg|add |satt |sätt )", folded)) or folded.startswith("add ")
+    if not adding or not re.search(r"(pil|arrow)", folded):
+        return False
+    if re.search(r"\bhand\b", folded):
+        return False
+    return bool(re.search(r"(honom|him\b|henne|her\b)", folded))
+
+
 def _add_hand_arrow(folded: str) -> bool:
     adding = bool(re.search(r"(lagg|add |satt |sätt )", folded)) or folded.startswith("add ")
     if not adding:
@@ -334,6 +379,8 @@ def _other_than_funnier(intent: dict) -> bool:
     return any(intent[key] for key in (
         "trim_open", "zoom_main", "remove_last_caption", "remove_word", "remove_kind",
         "add_hand_arrow", "zoom_touch", "start_reaction", "speed_open", "red_text", "grow_opening", "redo",
+        "zoom_reaction", "blur", "freeze", "speed_ramp", "slower", "captions_bigger", "satisfying_end",
+        "more_viral", "arrow_person",
     ))
 
 
@@ -351,7 +398,16 @@ def _apply_rules(analysis, plan, text, first, intent) -> dict:
         changes.append(_base_sentence(analysis, working))
     steps = [
         ("trim_open", lambda: _trim_opening(working, float(intent["trim_open"]), _duration(analysis))),
+        ("zoom_reaction", lambda: _zoom_reaction(working, analysis)),
         ("zoom_main", lambda: (True, _zoom_main(working, analysis))),
+        ("blur", lambda: _add_blur(working, analysis)),
+        ("freeze", lambda: _freeze(working, analysis)),
+        ("speed_ramp", lambda: _speed_ramp(working)),
+        ("slower", lambda: _slow_down(working)),
+        ("captions_bigger", lambda: _grow_captions(working)),
+        ("satisfying_end", lambda: _satisfying_end(working)),
+        ("more_viral", lambda: _more_viral(working, analysis) if not first else (True, "")),
+        ("arrow_person", lambda: _add_person_arrow(working, analysis)),
         ("zoom_touch", lambda: _zoom_touch(working, analysis)),
         ("start_reaction", lambda: _start_reaction(working, analysis)),
         ("speed_open", lambda: _speed_opening(working, float(intent["speed_open"]))),
@@ -368,7 +424,8 @@ def _apply_rules(analysis, plan, text, first, intent) -> dict:
         ok, message = fn()
         if not ok:
             return _fail(message + " Ingen ny MP4 skapades, och den förra planen ligger kvar.")
-        changes.append(message)
+        if message:
+            changes.append(message)
     _force_audio(working, mute=intent["mute"], music=intent["want_music"])
     if intent["keep_audio"] or intent["no_music"] or first:
         if intent["keep_audio"] or (first and not intent["mute"]):
@@ -621,7 +678,16 @@ def _near(hand: list[float], face: list[float]) -> bool:
     return fx - 0.08 <= hc[0] <= fx + fw + 0.08 and fy - 0.05 <= hc[1] <= fy + fh + 0.2
 
 
-def _zoom_range(plan: dict, t0: float, t1: float, analysis: dict) -> tuple[bool, str]:
+def _zoom_range(
+    plan: dict,
+    t0: float,
+    t1: float,
+    analysis: dict,
+    zoom_start: float = 1.2,
+    zoom_end: float = 1.65,
+    reason: str = "Inzoomning på intervallet instruktionen pekade ut.",
+    label: str = "zoom",
+) -> tuple[bool, str]:
     face = main_face_id(analysis)
     pieces = []
     hit = False
@@ -646,17 +712,237 @@ def _zoom_range(plan: dict, t0: float, t1: float, analysis: dict) -> tuple[bool,
             piece["sourceStart"] = left
             piece["sourceEnd"] = right
             if left < t1 and right > t0:
-                piece["zoomStart"] = 1.2
-                piece["zoomEnd"] = 1.65
+                piece["zoomStart"] = round(max(float(piece.get("zoomStart") or 1), zoom_start), 3)
+                piece["zoomEnd"] = round(max(float(piece.get("zoomEnd") or 1), zoom_end), 3)
                 if face:
                     piece["focusTrack"] = face
-                piece["label"] = "zoom"
-                piece["reason"] = "Inzoomning på intervallet instruktionen pekade ut."
+                piece["label"] = label
+                piece["reason"] = reason
             pieces.append(piece)
     if not hit or not pieces:
         return False, "Intervallet ligger utanför tidslinjen."
     plan["clips"] = pieces
-    return True, f"Inzoomning mellan {t0:.2f}s och {t1:.2f}s i källan."
+    return True, f"Inzoomning mellan {t0:.2f}s och {t1:.2f}s i källan. {reason}"
+
+
+def _zoom_reaction(plan: dict, analysis: dict) -> tuple[bool, str]:
+    from .story import build_story
+
+    story = build_story(analysis)
+    punch = story.get("punch")
+    if not punch:
+        return False, "Ingen rörelsetopp, inget leende och inget skratt hittades, så jag zoomar inte på en gissad reaktion."
+    zoom_end = float(punch["zoomEnd"])
+    zoom_start = float(punch["zoomStart"])
+    current = max((float(clip.get("zoomEnd") or 1) for clip in plan.get("clips") or []), default=1)
+    cap = 1.40 if punch.get("confirmed") else 1.20
+    if current >= zoom_end - 0.01:
+        zoom_end = min(cap, round(current + 0.08, 3))
+        zoom_start = min(zoom_end, round(max(zoom_start, current), 3))
+    track_id, kind = main_subject(analysis)
+    ok, message = _zoom_range(
+        plan,
+        float(punch["t0"]),
+        float(punch["t1"]),
+        analysis,
+        zoom_start=zoom_start,
+        zoom_end=zoom_end,
+        reason=str(punch["reason"]),
+        label="reaction" if punch.get("confirmed") else "motion",
+    )
+    if not ok:
+        return False, message
+    who = "en bekräftad reaktion" if punch.get("confirmed") else "den starkaste rörelsen"
+    identity = ""
+    if kind != "face":
+        identity = " Ingen ansiktsidentitet finns, så 'hans' eller 'hennes' kan inte pekas ut."
+    if kind == "person":
+        identity += f" Zoomen följer kroppsspåret {track_id}, inte ett ansikte."
+    elif kind is None:
+        identity += " Inget personspår finns, så zoomen sitter i mitten."
+    return True, message + f" Målet är {who}.{identity}"
+
+
+def _add_blur(plan: dict, analysis: dict) -> tuple[bool, str]:
+    rows, total = timeline(plan)
+    if not rows or total < 0.4:
+        return False, "Det finns inget klipp att sudda."
+    start = min(0.4, total * 0.2)
+    end = min(total, start + 0.7)
+    track_id, kind = main_subject(analysis)
+    plan.setdefault("effects", []).append({
+        "id": _new_id("e"),
+        "type": "blur",
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "track": track_id or "",
+    })
+    if kind in ("face", "person"):
+        return True, f"Bakgrunden suddas {start:.1f}–{end:.1f}s. Spåret {track_id} lämnas skarpt."
+    return True, f"Hela bilden suddas {start:.1f}–{end:.1f}s eftersom inget ansikte eller kroppsspår finns att skydda."
+
+
+def _freeze(plan: dict, analysis: dict) -> tuple[bool, str]:
+    from .story import build_story
+
+    story = build_story(analysis)
+    moment = float((story.get("peak") or {}).get("t") or 0)
+    duration = _duration(analysis)
+    if duration < 0.8:
+        return False, "Klippet är för kort för en frysruta."
+    moment = min(max(0.2, moment), max(0.2, duration - 0.3))
+    held = None
+    pieces = []
+    for clip in plan.get("clips") or []:
+        start, end = float(clip["sourceStart"]), float(clip["sourceEnd"])
+        if held is None and start <= moment < end and end - start >= 0.5:
+            head = copy.deepcopy(clip)
+            tail = copy.deepcopy(clip)
+            head["id"] = _new_id("c")
+            tail["id"] = _new_id("c")
+            head["sourceEnd"] = round(moment, 3)
+            tail["sourceStart"] = round(moment, 3)
+            freeze = copy.deepcopy(clip)
+            freeze["id"] = _new_id("c")
+            freeze["sourceStart"] = round(moment, 3)
+            freeze["sourceEnd"] = round(min(end, moment + 0.08), 3)
+            freeze["speed"] = 0.001
+            freeze["holdSec"] = 0.4
+            freeze["label"] = "freeze"
+            freeze["reason"] = "Frysruta på den starkaste uppmätta tidpunkten."
+            if head["sourceEnd"] - float(head["sourceStart"]) >= 0.2:
+                pieces.append(head)
+            pieces.append(freeze)
+            if float(tail["sourceEnd"]) - float(tail["sourceStart"]) >= 0.2:
+                pieces.append(tail)
+            held = moment
+            continue
+        pieces.append(clip)
+    if held is None or not pieces:
+        return False, "Frysrutan fick ingen plats i tidslinjen."
+    plan["clips"] = pieces
+    return True, f"En frysruta på 0,4s ligger vid {held:.2f}s i källan."
+
+
+def _speed_ramp(plan: dict) -> tuple[bool, str]:
+    if not plan.get("clips"):
+        return False, "Det finns inget klipp att rampa."
+    index = max(range(len(plan["clips"])), key=lambda item: float(plan["clips"][item]["sourceEnd"]) - float(plan["clips"][item]["sourceStart"]))
+    clip = plan["clips"][index]
+    start, end = float(clip["sourceStart"]), float(clip["sourceEnd"])
+    if end - start < 1.8:
+        clip["speed"] = 1.25
+        return True, "Klippet är kort, så hela biten spelas i 1,25x. En tredelad ramp fick inte plats."
+    cuts = [start, start + (end - start) / 3, start + 2 * (end - start) / 3, end]
+    speeds = (1.0, 1.28, 1.08)
+    pieces = []
+    for left, right, speed in zip(cuts, cuts[1:], speeds):
+        piece = copy.deepcopy(clip)
+        piece["id"] = _new_id("c")
+        piece["sourceStart"] = round(left, 3)
+        piece["sourceEnd"] = round(right, 3)
+        piece["speed"] = speed
+        piece["label"] = "ramp"
+        piece["reason"] = "Tempot ökar i mitten och faller tillbaka."
+        pieces.append(piece)
+    plan["clips"] = plan["clips"][:index] + pieces + plan["clips"][index + 1:]
+    return True, "En speed ramp delar klippet i 1,00x, 1,28x och 1,08x."
+
+
+def _slow_down(plan: dict) -> tuple[bool, str]:
+    changed = False
+    for clip in plan.get("clips") or []:
+        if float(clip.get("speed") or 1) > 1.05:
+            clip["speed"] = 1.0
+            changed = True
+    if changed:
+        return True, "Delar som gick fortare än 1x är tillbaka på normalt tempo."
+    if not plan.get("clips"):
+        return False, "Det finns inget klipp att sakta ner."
+    clip = max(plan["clips"], key=lambda item: float(item["sourceEnd"]) - float(item["sourceStart"]))
+    clip["speed"] = 0.85
+    return True, "Det längsta klippet spelas i 0,85x."
+
+
+def _grow_captions(plan: dict) -> tuple[bool, str]:
+    if not plan.get("captions"):
+        return False, "Det finns inga undertexter att förstora. Jag hittar inte på text."
+    for caption in plan["captions"]:
+        caption["fontSize"] = min(110, int(caption.get("fontSize") or 64) + 18)
+    return True, "Undertexterna är större."
+
+
+def _satisfying_end(plan: dict) -> tuple[bool, str]:
+    if not plan.get("clips"):
+        return False, "Det finns inget slut att hålla kvar."
+    clip = plan["clips"][-1]
+    start, end = float(clip["sourceStart"]), float(clip["sourceEnd"])
+    speed = float(clip.get("speed") or 1)
+    tail = 1.2 * speed
+    if end - start < tail + 0.4:
+        clip["speed"] = min(speed, 0.9)
+        return True, "Slutet är något långsammare. Ingen loop lades till."
+    head = copy.deepcopy(clip)
+    last = copy.deepcopy(clip)
+    head["id"] = _new_id("c")
+    last["id"] = _new_id("c")
+    head["sourceEnd"] = round(end - tail, 3)
+    last["sourceStart"] = head["sourceEnd"]
+    last["speed"] = 0.85
+    last["label"] = "ending"
+    last["reason"] = "Slutet får ligga kvar lite längre. Ingen påtvingad loop."
+    plan["clips"] = plan["clips"][:-1] + [head, last]
+    return True, "Sista 1,2 sekunderna spelas i 0,85x. Ingen loop lades till."
+
+
+def _more_viral(plan: dict, analysis: dict) -> tuple[bool, str]:
+    from .story import build_story
+
+    story = build_story(analysis)
+    notes = []
+    dead = float(story.get("deadOpeningS") or 0)
+    if dead >= 0.8:
+        ok, message = _trim_opening(plan, dead, _duration(analysis))
+        if ok:
+            notes.append(message)
+    punch = story.get("punch")
+    if punch:
+        ok, message = _zoom_range(
+            plan,
+            float(punch["t0"]),
+            float(punch["t1"]),
+            analysis,
+            zoom_start=float(punch["zoomStart"]),
+            zoom_end=float(punch["zoomEnd"]),
+            reason=str(punch["reason"]),
+            label="punch",
+        )
+        if ok:
+            notes.append(message)
+    if not notes:
+        return False, "Inget svagt parti eller någon rörelsetopp kunde ändras utan att hitta på en hook."
+    return True, " ".join(notes)
+
+
+def _add_person_arrow(plan: dict, analysis: dict) -> tuple[bool, str]:
+    track_id, kind = main_subject(analysis)
+    if not track_id:
+        return False, "Ingen person är spårad, så en pil skulle peka på en gissad punkt. Ingen pil lades in."
+    rows, total = timeline(plan)
+    if not rows:
+        return False, "Det finns ingen tidslinje att sätta pilen på."
+    start = min(0.6, max(0.2, total * 0.15))
+    plan.setdefault("effects", []).append({
+        "id": _new_id("e"),
+        "type": "arrow",
+        "start": round(start, 3),
+        "end": round(min(total, start + 1.2), 3),
+        "track": track_id,
+        "anchor": "below",
+    })
+    if kind == "face":
+        return True, f"En pil följer ansiktsspåret {track_id}."
+    return True, f"En pil följer kroppsspåret {track_id}. Det är en pose-ruta, inte ett ansikte och inte en identitet."
 
 
 def _start_reaction(plan: dict, analysis: dict) -> tuple[bool, str]:
@@ -963,6 +1249,18 @@ def _apply_op(plan: dict, analysis: dict, op: dict, intent: dict, first: bool) -
         return _red_accent(plan)
     if name == "grow_opening":
         return _grow_opening(plan)
+    if name == "zoom_reaction":
+        return _zoom_reaction(plan, analysis)
+    if name == "blur":
+        return _add_blur(plan, analysis)
+    if name == "freeze":
+        return _freeze(plan, analysis)
+    if name == "speed_ramp":
+        return _speed_ramp(plan)
+    if name == "slow_down":
+        return _slow_down(plan)
+    if name == "satisfying_end":
+        return _satisfying_end(plan)
     if name == "set_audio":
         _force_audio(plan, mute=not bool(op.get("keepOriginal", True)), music=bool(op.get("music")))
         return True, "audio"
@@ -985,6 +1283,13 @@ def _allowed_ops(intent: dict, first: bool) -> set[str]:
         "speed_open": "speed_opening",
         "red_text": "red_accent",
         "grow_opening": "grow_opening",
+        "zoom_reaction": "zoom_reaction",
+        "blur": "blur",
+        "freeze": "freeze",
+        "speed_ramp": "speed_ramp",
+        "slower": "slow_down",
+        "satisfying_end": "satisfying_end",
+        "more_viral": "zoom_reaction",
     }
     for key, op in mapping.items():
         if intent.get(key):
@@ -1035,6 +1340,12 @@ def _rejects(before, after, intent, analysis, text, first) -> str | None:
         after_zoom = max(float(clip.get("zoomEnd") or 1) for clip in after["clips"])
         if after_zoom < max(1.4, before_zoom + 0.08):
             return "Modellen zoomade inte in."
+    elif intent.get("zoom_reaction"):
+        after_zoom = max(float(clip.get("zoomEnd") or 1) for clip in after["clips"])
+        if after_zoom < 1.10:
+            return "Modellen zoomade inte på reaktionen."
+        if after_zoom > 1.42:
+            return "Modellen zoomade hårdare än 140%."
     elif not intent.get("zoom_touch"):
         after_zoom = max((float(clip.get("zoomEnd") or 1) for clip in after["clips"]), default=1)
         if after_zoom > 1.05:
@@ -1082,7 +1393,7 @@ def _describe(intent: dict, plan: dict, analysis: dict, first: bool) -> list[str
         changes.append(_base_sentence(analysis, plan))
     if intent.get("trim_open"):
         changes.append(f"De första {float(intent['trim_open']):.1f} sekunderna är borttagna.")
-    if intent.get("zoom_main"):
+    if intent.get("zoom_main") or intent.get("zoom_reaction"):
         face = main_face_id(analysis)
         zoom = max(float(clip.get("zoomEnd") or 1) for clip in plan["clips"])
         changes.append(f"Inzoomning till {zoom:.2f}" + (f" på {face}." if face else " mot mitten. Inget ansikte är spårat."))

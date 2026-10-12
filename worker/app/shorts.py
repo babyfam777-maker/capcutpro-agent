@@ -9,10 +9,11 @@ from __future__ import annotations
 import copy
 
 from .config import SHORT_DELIVERY
-from .creative import revise, track_view
+from .creative import parse_intent, revise, track_view
 from .export_spec import SHORT_EXPORT, describe_export
 from .ffmpeg_util import probe
 from .render import render_plan
+from .studio import apply_feedback_now, apply_studio, finish_metadata, format_reply, parse_feedback, review_frames, store_feedback
 
 
 def render_first_short(project, prompt: str, on_event) -> dict:
@@ -31,7 +32,9 @@ def render_first_short(project, prompt: str, on_event) -> dict:
     edited = revise(analysis, None, prompt, first=True)
     if not edited.get("ok"):
         raise RuntimeError(edited.get("error") or "Planen kunde inte byggas.")
-    return _commit(project, analysis, edited, on_event, prompt)
+    on_event("status", {"step": "trends"})
+    edited = apply_studio(analysis, edited, prompt, project, first=True)
+    return _commit(project, analysis, edited, on_event, prompt, first=True)
 
 
 def render_again(project, lines: list[str], on_event) -> dict:
@@ -52,6 +55,21 @@ def render_again(project, lines: list[str], on_event) -> dict:
     model_note = None
     for line in cleaned:
         project.messages.append({"role": "user", "content": line})
+        feedback = parse_feedback(line)
+        if feedback:
+            store_feedback(project, feedback)
+        intent = parse_intent(line)
+        if feedback and not intent["undo"] and not intent["any_edit"]:
+            result = apply_feedback_now(plan, analysis, feedback)
+            if not result["changed"]:
+                project.save_messages()
+                _speak(project, on_event, result["message"], plan)
+                return {"ok": True, "version": project.editor.active, "reply": result["message"]}
+            plan = result["plan"]
+            stack.append(copy.deepcopy(plan))
+            changes.append(result["message"])
+            backend = "rules"
+            continue
         edited = revise(analysis, plan, line, first=False)
         if edited.get("undo"):
             if len(stack) < 2:
@@ -72,10 +90,26 @@ def render_again(project, lines: list[str], on_event) -> dict:
     project.save_messages()
     on_event("edits", {"changes": changes, "skipped": []})
     edited = {"ok": True, "plan": plan, "changes": changes, "backend": backend, "modelNote": model_note}
-    return _commit(project, analysis, edited, on_event, " ".join(cleaned))
+    edited = apply_studio(analysis, edited, " ".join(cleaned), project, first=False)
+    return _commit(project, analysis, edited, on_event, " ".join(cleaned), first=False)
 
 
-def _commit(project, analysis: dict, edited: dict, on_event, instruction: str) -> dict:
+def _speak(project, on_event, reply: str, plan: dict) -> None:
+    project.messages.append({"role": "assistant", "content": reply, "trace": [{"name": "analytics", "ok": True}]})
+    project.save_messages()
+    on_event("done", {
+        "reply": reply,
+        "activeVersion": project.editor.active,
+        "videoUrl": f"/projects/{project.id}/versions/{project.editor.active}/video" if project.editor.active else None,
+        "changes": [],
+        "skipped": [],
+        "backend": "rules",
+        "hook": "",
+        "packaging": (plan.get("studio") or {}).get("packaging"),
+    })
+
+
+def _commit(project, analysis: dict, edited: dict, on_event, instruction: str, first: bool = False) -> dict:
     plan = edited["plan"]
     plan.setdefault("decision", {})
     plan["decision"]["backend"] = edited.get("backend")
@@ -88,12 +122,12 @@ def _commit(project, analysis: dict, edited: dict, on_event, instruction: str) -
     _write_timeline(project, plan, edited)
     previous = copy.deepcopy(project.editor.plan)
     try:
-        saved = _render(project, plan, view, analysis, on_event)
+        saved = _render(project, plan, view, analysis, on_event, edited, instruction, first)
     except Exception:
         project.editor.plan = previous
         project.save()
         raise
-    reply = _reply(saved, edited)
+    reply = format_reply(saved, {"plan": saved.get("plan") or plan, "changes": edited.get("changes")}, instruction)
     project.messages.append({
         "role": "assistant",
         "content": reply,
@@ -110,12 +144,13 @@ def _commit(project, analysis: dict, edited: dict, on_event, instruction: str) -
         "changes": edited.get("changes") or [],
         "skipped": [],
         "backend": edited.get("backend"),
-        "hook": "",
+        "hook": ((plan.get("studio") or {}).get("packaging") or {}).get("chosenHook") or "",
+        "packaging": (plan.get("studio") or {}).get("packaging"),
     })
     return saved
 
 
-def _render(project, plan: dict, view: dict, analysis: dict, on_event) -> dict:
+def _render(project, plan: dict, view: dict, analysis: dict, on_event, edited: dict | None = None, instruction: str = "", first: bool = False) -> dict:
     on_event("status", {"step": "render"})
     version, folder = project.next_version_folder()
     out = folder / "output.mp4"
@@ -130,8 +165,31 @@ def _render(project, plan: dict, view: dict, analysis: dict, on_event) -> dict:
         on_progress=lambda progress: on_event("progress", {"progress": round(progress, 3)}),
         delivery=delivery,
     )
+    story = (edited or {}).get("story") or {}
+    trends = (edited or {}).get("trends") or {}
+    if story:
+        plan, critique, changed = review_frames(out, plan, analysis, story, trends, first=first)
+        if changed:
+            on_event("status", {"step": "render"})
+            probe_info = render_plan(
+                project.original,
+                view,
+                plan,
+                out,
+                on_progress=lambda progress: on_event("progress", {"progress": round(progress, 3)}),
+                delivery=delivery,
+            )
+            plan.setdefault("studio", {})["secondPass"] = True
+            plan["studio"]["critique"] = critique
+        else:
+            plan.setdefault("studio", {})["critique"] = critique
     on_event("status", {"step": "qa"})
     qa = _qa(out, plan, analysis, delivery)
+    if story:
+        finish_metadata(plan, analysis, story, trends, plan.get("studio", {}).get("critique") or {}, probe_info, qa, instruction)
+        gate = (plan.get("studio") or {}).get("gate") or {}
+        if gate.get("hardFailures"):
+            raise RuntimeError("Kvalitetsgrinden stoppade filen: " + ", ".join(gate["hardFailures"]))
     on_event("qa", qa)
     if not qa.get("playable"):
         raise RuntimeError("Filen är inte en spelbar MP4. " + " ".join(

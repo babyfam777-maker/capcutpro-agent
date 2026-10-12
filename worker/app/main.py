@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from .config import MODEL, OPENAI_BASE_URL, WORKER_TOKEN
 from .ffmpeg_util import run
 from .llm_local import health as llm_health
+from .trending import status as trending_status
 from .shorts import render_again, render_first_short
 from .store import Project, store
 
@@ -47,6 +48,7 @@ def health():
         "baseUrl": OPENAI_BASE_URL,
         "paidProviders": False,
         "llm": brain,
+        "trending": trending_status(),
     }
 
 

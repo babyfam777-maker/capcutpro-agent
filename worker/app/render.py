@@ -23,7 +23,8 @@ from .plan_ops import timeline
 from .sfx import ensure_sfx
 
 SAFE_TOP = 220
-SAFE_BOTTOM = 320
+# 30% of 1920. Overlay bottoms stay at or above 70% from the top.
+SAFE_BOTTOM = 576
 SAFE_SIDE = 60
 
 
@@ -256,6 +257,11 @@ def _encode_pipe(original, analysis, plan, audio, out_path, on_progress, filters
                 src_span = float(row["sourceEnd"]) - float(row["sourceStart"])
                 src_t = float(row["sourceStart"]) if float(row["speed"]) <= 0.001 else float(row["sourceStart"]) + src_span * u
                 target = _focus_point(analysis, row, src_t)
+                if _effect_live(plan, "shake", out_t):
+                    target = (
+                        min(0.98, max(0.02, target[0] + 0.012 * np.sin(out_t * 28))),
+                        min(0.98, max(0.02, target[1] + 0.008 * np.cos(out_t * 24))),
+                    )
                 if smooth is None:
                     smooth = target
                 else:
@@ -266,6 +272,8 @@ def _encode_pipe(original, analysis, plan, audio, out_path, on_progress, filters
                     mix = 0.42 if done == 0 else 0.18
                     image = np.clip(image.astype(np.float32) * (1 - mix) + 255 * mix, 0, 255).astype(np.uint8)
                 faces = _project_faces(analysis, src_t, window, sw, sh)
+                if _effect_live(plan, "blur", out_t):
+                    image = _blur_keep_subjects(image, faces)
                 _composite(image, plan, out_t, faces, cache)
                 proc.stdin.write(image.tobytes())
                 done += 1
@@ -400,7 +408,10 @@ def _project_faces(analysis: dict, src_t: float, window, sw: int, sh: int) -> li
 
 def _composite(image: np.ndarray, plan: dict, out_t: float, faces: list[dict], cache: dict) -> None:
     order = {"circle": 0, "arrow": 1, "emoji": 2, "badge": 3, "text": 4}
-    effects = [e for e in plan["effects"] if e["type"] != "sound_effect" and float(e["start"]) <= out_t < float(e["end"])]
+    effects = [
+        e for e in plan["effects"]
+        if e["type"] not in ("sound_effect", "blur", "shake") and float(e["start"]) <= out_t < float(e["end"])
+    ]
     effects.sort(key=lambda e: order.get(e["type"], 5))
     for effect in effects:
         sprite = _effect_sprite(effect, cache)
@@ -418,7 +429,7 @@ def _composite(image: np.ndarray, plan: dict, out_t: float, faces: list[dict], c
             sprite = _caption_sprite(caption, cache)
             local = out_t - float(caption["start"])
             sprite = gfx.scale_sprite(sprite, gfx.pop_scale(local) if local < 0.18 else 1)
-            x, y = _avoid(sprite, faces, prefer_y=int(_canvas().h * 0.72))
+            x, y = _avoid(sprite, faces, prefer_y=int(_canvas().h * 0.52))
             gfx.blit(image, sprite, x, y)
 
 
@@ -485,8 +496,52 @@ def _anchor(effect: dict, sprite: Image.Image, faces: list[dict]) -> tuple[int, 
     else:
         x = int(face["x"] + face["w"] / 2 - sprite.width / 2)
         y = int(face["y"] - sprite.height - 24)
-    x = int(min(max(x, canvas.safe_side), canvas.w - canvas.safe_side - sprite.width))
-    y = int(min(max(y, canvas.safe_top), canvas.h - canvas.safe_bottom - sprite.height))
+    return _clear_of_faces(x, y, sprite, faces)
+
+
+def _effect_live(plan: dict, kind: str, out_t: float) -> bool:
+    for effect in plan.get("effects") or []:
+        if effect.get("type") != kind:
+            continue
+        if float(effect.get("start") or 0) <= out_t < float(effect.get("end") or 0):
+            return True
+    return False
+
+
+def _blur_keep_subjects(image: np.ndarray, faces: list[dict]) -> np.ndarray:
+    import cv2
+
+    blurred = cv2.GaussianBlur(image, (31, 31), 0)
+    if not faces:
+        return blurred
+    out = blurred
+    height, width = image.shape[:2]
+    for face in faces:
+        x0 = max(0, int(face["x"]))
+        y0 = max(0, int(face["y"]))
+        x1 = min(width, int(face["x"] + face["w"]))
+        y1 = min(height, int(face["y"] + face["h"]))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            continue
+        out[y0:y1, x0:x1] = image[y0:y1, x0:x1]
+    return out
+
+
+def _clear_of_faces(x: int, y: int, sprite: Image.Image, faces: list[dict]) -> tuple[int, int]:
+    canvas = _canvas()
+    limit = int(canvas.h * 0.70) - sprite.height
+    x = int(min(max(x, canvas.safe_side), max(canvas.safe_side, canvas.w - canvas.safe_side - sprite.width)))
+    y = int(min(max(y, canvas.safe_top), max(canvas.safe_top, limit)))
+
+    def hit(px: int, py: int) -> float:
+        return sum(_overlap(px, py, sprite.width, sprite.height, face["x"], face["y"], face["w"], face["h"]) for face in faces)
+
+    if hit(x, y) <= 0:
+        return x, y
+    for py in (y - sprite.height - 12, canvas.safe_top, int(canvas.h * 0.22)):
+        py = int(min(max(py, canvas.safe_top), max(canvas.safe_top, limit)))
+        if hit(x, py) <= 0:
+            return x, py
     return x, y
 
 
@@ -511,10 +566,14 @@ def _avoid(sprite: Image.Image, faces: list[dict], prefer_y: int) -> tuple[int, 
     factor = canvas.factor
     x = int((canvas.w - sprite.width) / 2)
     x = int(min(max(x, canvas.safe_side), max(canvas.safe_side, canvas.w - canvas.safe_side - sprite.width)))
-    candidates = [prefer_y] + [int(round(y * factor)) for y in (280, 460, 700, 980, 1280, 1480)]
+    limit = int(canvas.h * 0.70) - sprite.height
+    candidates = [prefer_y] + [int(round(y * factor)) for y in (280, 460, 640, 860, 1040)]
+    candidates = [y for y in candidates if y <= limit]
+    if not candidates:
+        candidates = [max(canvas.safe_top, limit)]
     best = None
     for y in candidates:
-        y = int(min(max(y, canvas.safe_top), canvas.h - canvas.safe_bottom - sprite.height))
+        y = int(min(max(y, canvas.safe_top), max(canvas.safe_top, limit)))
         hit = sum(_overlap(x, y, sprite.width, sprite.height, f["x"], f["y"], f["w"], f["h"]) for f in faces)
         # Prefer the requested lane when nothing collides.
         score = hit + abs(y - prefer_y) * 0.01

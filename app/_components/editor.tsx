@@ -374,7 +374,7 @@ export function Editor() {
             {progress !== null ? <p className="mt-1 text-xs text-white/50">{Math.round(progress * 100)}%</p> : null}
             <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto text-sm text-white/80">
               {log.map((line, index) => (
-                <li key={`${index}-${line}`}>{line}</li>
+                <li className="whitespace-pre-wrap" key={`${index}-${line}`}>{line}</li>
               ))}
             </ul>
             {error ? (
@@ -401,7 +401,7 @@ export function Editor() {
             </div>
             <div className="min-h-16 flex-1 space-y-2 overflow-y-auto">
               {project?.messages.map((message, index) => (
-                <p className={message.role === "user" ? "text-sm text-white" : "text-sm text-white/70"} key={`${message.role}-${index}`}>
+                <p className={`whitespace-pre-wrap ${message.role === "user" ? "text-sm text-white" : "text-sm text-white/70"}`} key={`${message.role}-${index}`}>
                   <span className="mr-2 text-xs uppercase tracking-wide text-white/40">{message.role === "user" ? "Du" : "CapCutPro"}</span>
                   {message.content}
                 </p>

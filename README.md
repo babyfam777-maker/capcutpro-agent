@@ -70,6 +70,14 @@ bash start.sh
 
 Det startar Ollama om den är installerad, workern och sidan på [http://127.0.0.1:3000](http://127.0.0.1:3000). Docker: `bash start.sh --docker`.
 
+## Trenddata och paket
+
+Varje render får en titel, en hooktext, en beskrivning och hashtags i chatten, byggda från det som analysen faktiskt mätte. En intern viralpoäng räknas, men den visas bara om du ber om poängen. En andra genomgång läser de renderade bildrutorna och gör om klippet bara när öppningen fortfarande är svag.
+
+Trendfilerna ligger i `data/trending/`. Dagens YouTube-lista (`rsrishav/youtube-trending-video-dataset`) och den äldre listan med visningar (`datasnaek/youtube-new`) hämtas bara om en gratis Kaggle-token finns: `KAGGLE_USERNAME` och `KAGGLE_KEY`, eller `~/.kaggle/kaggle.json`. Utan token används en öppen titelspegel från 2019–2020. Den är märkt historisk, saknar visningar och region, och är inte dagens lista. Inga titlar kopieras från andra kanaler.
+
+YouTube Analytics kan klistras in i chatten (views, AVD, swipes, early drop). Lärdomen sparas och används på nästa klipp: tidig tapp påverkar hooken, mitten tempot, slutet payoff.
+
 ## Byta AI-modell
 
 Workern pratar med vilket program som helst som har samma API som OpenAI. Standard är Ollama på den här datorn.
