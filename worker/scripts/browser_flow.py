@@ -30,13 +30,22 @@ def main() -> None:
         browser = playwright.chromium.launch(
             headless=False,
             channel="chrome",
-            args=["--autoplay-policy=no-user-gesture-required", "--use-fake-ui-for-media-stream"],
+            args=["--autoplay-policy=no-user-gesture-required", "--no-sandbox", "--disable-dev-shm-usage"],
         )
         page = browser.new_page(viewport={"width": 1440, "height": 1100})
-        page.set_default_timeout(1_200_000)
+        page.set_default_timeout(30_000)
+        print("open", PAGE, flush=True)
         page.goto(PAGE, wait_until="domcontentloaded")
+        print("page ready", flush=True)
+        page.locator("#story-prompt").wait_for()
+        page.get_by_text("Släpp en video här").wait_for()
+        page.wait_for_timeout(800)
         page.locator("#video-file").set_input_files(str(SOURCE))
-        page.get_by_text("Ny video", exact=True).wait_for(timeout=120_000)
+        try:
+            page.get_by_text("Ny video", exact=True).wait_for(timeout=30_000)
+        except Exception:
+            page.locator("#video-file").set_input_files(str(SOURCE))
+            page.get_by_text("Ny video", exact=True).wait_for(timeout=60_000)
         shot(page, "01-uploaded")
         page.locator("#story-prompt").fill(PROMPT)
         shot(page, "02-prompt")
@@ -57,6 +66,7 @@ def main() -> None:
             page.wait_for_timeout(1000)
         else:
             raise SystemExit("first render did not finish")
+        print("first job finished", flush=True)
         if not played_live:
             open_version(page, 1)
             play = play_video(page)
@@ -75,14 +85,17 @@ def main() -> None:
             raise SystemExit("the page never showed which trend signal drove the cut")
         page.get_by_placeholder("Gör hooken större").fill(REVISION)
         shot(page, "05-revision-typed")
+        print("render again", flush=True)
         page.get_by_role("button", name="RENDER IGEN").click()
         wait_src(page, "/versions/3/")
         page.wait_for_function(
             """() => {
-                const button = [...document.querySelectorAll("button")].find((item) => item.textContent && item.textContent.includes("RENDER IGEN"));
+                const button = [...document.querySelectorAll("button")].find((item) => item.textContent && item.textContent.includes("GÖR MIN SHORT"));
                 return button && !button.disabled;
-            }"""
+            }""",
+            timeout=180_000,
         )
+        print("v3 ready", flush=True)
         play = play_video(page)
         report["steps"].append({"name": "play-v3", **play})
         shot(page, "06-v3-playing")
@@ -124,8 +137,13 @@ def button_enabled(page, label: str) -> bool:
 
 
 def open_version(page, version: int) -> None:
-    page.get_by_role("button", name=re.compile(rf"^v{version}\\b")).click()
-    wait_src(page, f"/versions/{version}/")
+    needle = f"/versions/{version}/"
+    src = page.locator("video").get_attribute("src") or ""
+    print(f"open v{version} from {src}", flush=True)
+    if needle not in src:
+        page.locator("button", has_text=re.compile(rf"^v{version}\b")).first.click(timeout=15_000)
+        wait_src(page, needle)
+    print(f"showing v{version}", page.locator("video").get_attribute("src"), flush=True)
 
 
 def wait_src(page, needle: str) -> None:
@@ -141,25 +159,27 @@ def wait_src(page, needle: str) -> None:
 
 
 def play_video(page) -> dict:
+    page.locator("video").click(timeout=10_000, force=True)
     return page.evaluate(
         """async () => {
             const video = document.querySelector("video");
             if (!video) return {ok: false, reason: "no video"};
-            video.muted = false;
-            try {
-                await video.play();
-            } catch (error) {
-                video.muted = true;
-                try { await video.play(); } catch (again) {
-                    return {ok: false, reason: String(again), src: video.currentSrc};
-                }
-            }
             const started = performance.now();
-            while (video.currentTime < 0.2 && performance.now() - started < 15000) {
+            const attempt = async (muted) => {
+                video.muted = muted;
+                const played = video.play();
+                await Promise.race([
+                    played.catch(() => null),
+                    new Promise((resolve) => setTimeout(resolve, 8000)),
+                ]);
+            };
+            await attempt(false);
+            if (video.paused) await attempt(true);
+            while (video.currentTime < 0.25 && performance.now() - started < 12000) {
                 await new Promise((resolve) => setTimeout(resolve, 100));
             }
             return {
-                ok: video.currentTime >= 0.2 && !video.error,
+                ok: video.currentTime >= 0.25 && !video.error && video.videoWidth > 0,
                 currentTime: video.currentTime,
                 duration: video.duration,
                 width: video.videoWidth,
