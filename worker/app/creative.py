@@ -1361,9 +1361,12 @@ def _rejects(before, after, intent, analysis, text, first) -> str | None:
 def _invented(plan: dict, analysis: dict, user: str) -> bool:
     phrases = [fold(row["text"]) for row in supported_phrases(analysis)]
     user_folded = fold(user)
+    allowed = _factual_tokens(plan)
     for text in _texts(plan):
         token = fold(text)
         if not token:
+            continue
+        if token in allowed:
             continue
         if token in _HYPE and token not in user_folded and token not in phrases:
             return True
@@ -1371,6 +1374,14 @@ def _invented(plan: dict, analysis: dict, user: str) -> bool:
             continue
         return True
     return False
+
+
+def _factual_tokens(plan: dict) -> set[str]:
+    found = {fold(str(item)) for item in ((plan.get("studio") or {}).get("factualLabels") or []) if str(item).strip()}
+    for effect in plan.get("effects") or []:
+        if effect.get("factual") and effect.get("text"):
+            found.add(fold(str(effect["text"])))
+    return {token for token in found if token}
 
 
 def _texts(plan: dict) -> list[str]:

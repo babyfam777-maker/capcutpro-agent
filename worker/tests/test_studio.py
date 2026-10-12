@@ -168,6 +168,114 @@ def test_caption_lane_stays_above_seventy_percent():
         _CANVAS.reset(token)
 
 
+def test_trends_change_pacing_label_and_name_the_signal():
+    from app.studio import _shape, drive_with_trends
+
+    analysis = _analysis()
+    story = build_story(analysis)
+    plan = initial_plan(analysis)
+    _shape(plan, analysis, story)
+    trends = analyze_trending_data("music", None, "US")
+    driven = drive_with_trends(plan, analysis, story, trends)
+    kinds = {row["choice"] for row in driven["choices"]}
+    assert {"hook", "structure", "pacing", "title", "on-screen text", "payoff", "rewatch"} <= kinds
+    assert any("title_structures.number" in row["signal"] for row in driven["choices"])
+    assert any(abs(float(clip.get("speed") or 1) - 1.12) < 0.001 for clip in plan["clips"])
+    assert any(effect.get("factual") and str(effect.get("text") or "").endswith("s") for effect in plan["effects"])
+    assert not any(str(effect.get("text") or "") == "LOOK" for effect in plan["effects"])
+    gate = quality_gate(
+        plan,
+        analysis,
+        story,
+        {"copiedTitles": False},
+        {"width": 1080, "height": 1920, "duration": 11},
+        {"playable": True, "duration": 11},
+    )
+    assert "captions" not in gate["hardFailures"]
+    assert gate["ok"] is True
+
+
+def test_question_pattern_is_the_chosen_title_without_copying_a_channel():
+    story = build_story(_analysis())
+    trends = analyze_trending_data("", None, "US")
+    packed = package(_analysis(), story, trends, initial_plan(_analysis()))
+    assert packed["bestTitle"].startswith("What happens at")
+    assert "Babish" not in packed["bestTitle"]
+    assert float((trends.get("title_structures") or {}).get("question") or 0) >= 0.08
+
+
+def test_second_pass_moves_a_late_peak_to_the_front():
+    from app.studio import _shape, improve_rendered
+
+    analysis = _analysis()
+    analysis["motion"] = [{"t": index / 2, "energy": 0.3 if index < 16 else 8.0} for index in range(22)]
+    story = build_story(analysis)
+    assert story["punch"]["t0"] > 3
+    plan = initial_plan(analysis)
+    _shape(plan, analysis, story)
+    before = float(plan["clips"][0]["sourceStart"])
+    changed, note = improve_rendered(
+        plan,
+        analysis,
+        story,
+        {"weak": True, "reasons": ["first 3s motion 1.20 vs later 7.40; punch zoom output at 8.00s"]},
+    )
+    assert changed is True
+    assert float(plan["clips"][0]["sourceStart"]) > before + 2
+    assert abs(float(plan["clips"][0]["sourceStart"]) - float(story["punch"]["t0"])) < 0.05
+    assert "inte en bekräftad reaktion" in note
+    assert float(plan["clips"][0]["zoomEnd"]) <= 1.20
+
+
+def test_second_pass_leaves_a_strong_render_alone():
+    from app.studio import improve_rendered
+
+    plan = initial_plan(_analysis())
+    changed, note = improve_rendered(plan, _analysis(), build_story(_analysis()), {"weak": False, "reasons": []})
+    assert changed is False
+    assert note == ""
+    assert float(plan["clips"][0]["sourceStart"]) == 0
+
+
+def test_trending_failure_does_not_raise(monkeypatch):
+    import app.trending as trending
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("kaggle down")
+
+    monkeypatch.setattr(trending, "_analyze_trending_data", boom)
+    report = trending.analyze_trending_data("music", None, "US")
+    assert report["vintage"] == "fallback"
+    assert report["trend_score"] == 0
+    assert report["views_available"] is False
+    assert "fortsätter" in report["note"]
+
+
+def test_factual_timestamp_passes_the_gate():
+    plan = initial_plan(_analysis())
+    plan["studio"] = {"factualLabels": ["1.5s"]}
+    plan["effects"] = [{
+        "id": "e1",
+        "type": "text",
+        "kind": "headline",
+        "text": "1.5s",
+        "factual": True,
+        "start": 0.2,
+        "end": 1.4,
+        "fontSize": 96,
+    }]
+    story = build_story(_analysis())
+    gate = quality_gate(
+        plan,
+        _analysis(),
+        story,
+        {"copiedTitles": False},
+        {"width": 1080, "height": 1920, "duration": 11},
+        {"playable": True, "duration": 11},
+    )
+    assert gate["ok"] is True
+
+
 def test_preprocess_file_roundtrip(tmp_path: Path, monkeypatch):
     path = tmp_path / "us.csv"
     path.write_text("title,views,category_id\nHello there,10,24\n", encoding="utf-8")

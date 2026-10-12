@@ -6,6 +6,7 @@ unless the user asks for it.
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import subprocess
@@ -27,28 +28,34 @@ def apply_studio(analysis: dict, edited: dict, instruction: str, project, *, fir
     trends = analyze_trending_data(_topic(instruction), None, _region(instruction))
     changes = list(edited.get("changes") or [])
     learnings = _load(project)
+    influences: list[dict] = []
     if first and not _KEEP_WHOLE.search(creative.fold(instruction)):
         changes.extend(_shape(plan, analysis, story))
+        driven = drive_with_trends(plan, analysis, story, trends)
+        influences = driven["choices"]
+        changes.extend(driven["lines"])
     else:
         applied = _apply_pending(plan, analysis, learnings, creative.parse_intent(instruction))
         if applied:
             changes.append(applied)
             _save(project, learnings)
     critique = _score_edit(plan, analysis, story, trends, frames=None)
-    second = False
     if first and critique["weak"]:
         extra = _repair(plan, analysis, story)
         if extra:
             changes.append(extra)
-            second = True
             critique = _score_edit(plan, analysis, story, trends, frames=None)
             critique["preRenderRepair"] = extra
+    prior = plan.get("studio") or {}
     plan["studio"] = {
         "story": _public_story(story),
         "viralScore": critique["viralScore"],
         "trends": _public_trends(trends),
         "critique": critique,
-        "secondPass": second,
+        "secondPass": False,
+        "trendChoices": influences,
+        "factualLabels": list(prior.get("factualLabels") or []),
+        "titlePreference": prior.get("titlePreference"),
         "learningsApplied": [row.get("id") for row in learnings if row.get("applied")],
     }
     edited = dict(edited)
@@ -92,10 +99,17 @@ def package(analysis: dict, story: dict, trends: dict, plan: dict) -> dict:
     peak = story.get("peak") or {}
     peak_t = float(peak.get("t") or 0)
     tracking = story.get("tracking") or {}
+    structures = trends.get("title_structures") or {}
+    question_share = float(structures.get("question") or 0)
+    number_share = float(structures.get("number") or 0)
     titles = []
+    if peak and question_share >= 0.08:
+        titles.append(f"What happens at {peak_t:.1f}s?")
     if phrases:
         titles.append(_clip(phrases[0]["text"], 70))
-    if peak:
+    if peak and number_share >= 0.1:
+        titles.append(f"{peak_t:.1f}s is the busiest moment")
+    elif peak:
         titles.append(f"The busiest moment is at {peak_t:.1f}s")
     titles.append(f"{duration:.0f}s vertical cut, original audio kept")
     if tracking.get("face") == "ok":
@@ -112,6 +126,8 @@ def package(analysis: dict, story: dict, trends: dict, plan: dict) -> dict:
     while len(titles) < 5:
         titles.append(f"9:16 reframing of the {duration:.0f}s upload")
     hooks = []
+    if peak and question_share >= 0.08:
+        hooks.append(f"What happens at {peak_t:.1f} seconds?")
     if phrases:
         hooks.append(_clip(phrases[0]["text"], 80))
     if peak:
@@ -128,7 +144,10 @@ def package(analysis: dict, story: dict, trends: dict, plan: dict) -> dict:
         hooks.append("The cut does not invent a reaction or a quote.")
     best = titles[0]
     chosen = hooks[0]
-    if peak and not phrases:
+    if peak and question_share >= 0.08 and not phrases:
+        best = next((title for title in titles if title.startswith("What happens")), titles[0])
+        chosen = next((hook for hook in hooks if hook.startswith("What happens")), hooks[0])
+    elif peak and not phrases:
         best = next((title for title in titles if "busiest" in title), titles[0])
         chosen = next((hook for hook in hooks if "busiest" in hook), hooks[0])
     description = (
@@ -208,10 +227,8 @@ def format_reply(saved: dict, edited: dict, instruction: str) -> str:
     packaging = studio.get("packaging") or {}
     critique = studio.get("critique") or {}
     gate = studio.get("gate") or {}
-    lines = [
-        f"v{saved['version']} är klar ({float(probe.get('duration') or 0):.1f}s, {size}).",
-        " ".join(edited.get("changes") or []),
-    ]
+    lines = [f"v{saved['version']} är klar ({float(probe.get('duration') or 0):.1f}s, {size})."]
+    lines.extend(str(change) for change in (edited.get("changes") or []) if str(change).strip())
     if packaging:
         lines.append(f"Titel: {packaging.get('bestTitle')}")
         others = [title for title in packaging.get("titles") or [] if title != packaging.get("bestTitle")]
@@ -223,10 +240,31 @@ def format_reply(saved: dict, edited: dict, instruction: str) -> str:
             lines.append("Andra hooktexter: " + " | ".join(other_hooks))
         lines.append(f"Beskrivning: {packaging.get('description')}")
         lines.append("Hashtags: " + " ".join(packaging.get("hashtags") or []))
-    if critique.get("frameRepair") or critique.get("preRenderRepair") or studio.get("secondPass"):
-        lines.append("En andra genomgång ändrade klippet innan det rapporterades klart.")
-    elif critique.get("frames"):
-        lines.append("Renderade bildrutor lästes igen. Ingen andra ändring behövdes.")
+    if critique.get("preRenderRepair"):
+        lines.append("Innan första render justerades planen: " + str(critique.get("preRenderRepair")))
+    for choice in studio.get("trendChoices") or []:
+        lines.append(f"Trendval {choice.get('choice')}: {choice.get('signal')} → {choice.get('decision')}")
+    measure = studio.get("measure") or {}
+    if measure:
+        reasons = " ".join(str(item) for item in (measure.get("reasons") or []))
+        verdict = f"Svag. {reasons}".strip() if measure.get("weak") else "Inte svag mot de uppmätta bildrutorna."
+        lines.append(
+            "Kritik av renderad fil: "
+            f"första 3s rörelse {measure.get('openingMotion')}, senare {measure.get('laterMotion')}, "
+            f"rörelsetopp i output vid {measure.get('punchOut')}s. {verdict}"
+        )
+    if studio.get("secondPass"):
+        parent = studio.get("parentVersion")
+        lines.append(
+            "En ny MP4 renderades efter kritiken"
+            + (f" (v{parent} finns kvar och kan spelas)." if parent else ".")
+            + " "
+            + str(studio.get("critiqueNote") or "")
+        )
+    elif studio.get("critiqueNote"):
+        lines.append(str(studio["critiqueNote"]))
+    elif measure:
+        lines.append("Andra passet mätte den renderade filen och gjorde ingen ny version, eftersom inget av kontrollerna var svagt.")
     if gate:
         failed = [row["name"] for row in gate.get("checks") or [] if not row.get("ok")]
         lines.append("Kvalitetsgrind: " + ("alla hårda kontroller klara." if gate.get("ok") else "stopp: " + ", ".join(gate.get("hardFailures") or failed)))
@@ -319,6 +357,485 @@ def apply_feedback_now(plan: dict, analysis: dict, feedback: dict) -> dict:
     if not notes:
         notes.append("Analysen sparades. Inget i tidslinjen kunde ändras utan att hitta på ett skäl.")
     return {"changed": changed, "plan": plan, "message": " ".join(notes)}
+
+
+def drive_with_trends(plan: dict, analysis: dict, story: dict, trends: dict) -> dict:
+    """Let compact trend stats change the first cut. Every choice names its signal."""
+    structures = trends.get("title_structures") or {}
+    number = float(structures.get("number") or 0)
+    question = float(structures.get("question") or 0)
+    median = trends.get("title_length_median")
+    vintage = trends.get("vintage") or "missing"
+    source = trends.get("source") or "none"
+    views = bool(trends.get("views_available"))
+    peak = story.get("peak") or {}
+    punch = story.get("punch") or {}
+    choices: list[dict] = []
+    lines: list[str] = []
+
+    def record(choice: str, signal: str, decision: str) -> None:
+        choices.append({"choice": choice, "signal": signal, "decision": decision})
+        lines.append(f"Trend → {choice}: {signal} → {decision}")
+
+    studio = plan.setdefault("studio", {})
+    if number >= 0.1 and peak:
+        record(
+            "hook",
+            f"title_structures.number={number:.3f} ({vintage}, {source})",
+            f"The punch stays on the measured peak at {float(peak['t']):.1f}s. v1 does not invent an earlier hook.",
+        )
+    elif punch:
+        record(
+            "hook",
+            f"title_structures.number={number:.3f} ({vintage})",
+            "Number share is too low to move the hook, so the measured peak stays where the footage put it.",
+        )
+    else:
+        record("hook", f"title_structures.number={number:.3f}; no measured peak", "No hook was invented from other channels' titles.")
+
+    if number >= 0.1 and punch:
+        record(
+            "structure",
+            f"title_structures.number={number:.3f}",
+            "The timeline is split into the peak window and the rest: one concrete moment, not a flat clip.",
+        )
+    else:
+        record("structure", f"title_structures.number={number:.3f}", "No extra split. The measured clips stay in order.")
+
+    sped = False
+    if (question >= 0.08 or number >= 0.08) and punch:
+        t0 = float(punch["t0"])
+        for clip in plan.get("clips") or []:
+            if float(clip["sourceEnd"]) <= t0 + 0.05 and float(clip.get("speed") or 1) <= 1.05:
+                clip["speed"] = 1.12
+                sped = True
+        if sped:
+            record(
+                "pacing",
+                f"question={question:.3f} number={number:.3f}",
+                "Setup clips that end before the peak play at 1.12x. The peak and the ending stay at 1.0.",
+            )
+        else:
+            record(
+                "pacing",
+                f"question={question:.3f} number={number:.3f}",
+                "No setup clip sits fully before the peak, so the speed stays 1.0.",
+            )
+    else:
+        record("pacing", f"question={question:.3f} number={number:.3f}", "Shares are too low to change the pace. Speed stays with the footage.")
+
+    if clips := plan.get("clips") or []:
+        last = clips[-1]
+        if float(last.get("speed") or 1) > 1.0:
+            last["speed"] = 1.0
+    for effect in plan.get("effects") or []:
+        if effect.get("type") == "sound_effect":
+            mapped = creative._source_to_output(plan, float(effect.get("time") or 0))
+            if mapped is not None:
+                effect["time"] = round(mapped, 3)
+
+    if question >= 0.08 and peak:
+        studio["titlePreference"] = "question"
+        record(
+            "title",
+            f"title_structures.question={question:.3f}; title length median {median}",
+            f"The chosen title is a question about the measured peak at {float(peak['t']):.1f}s. It is shorter than the median because it only names that timestamp. No channel name is copied.",
+        )
+    else:
+        studio["titlePreference"] = "fact"
+        record("title", f"title_structures.question={question:.3f}", "The title stays a factual description of this clip.")
+
+    if number >= 0.1 and peak and punch:
+        label = f"{float(peak['t']):.1f}s"
+        moment = creative._source_to_output(plan, float(punch.get("t0") or peak["t"]))
+        if moment is not None:
+            plan.setdefault("effects", [])
+            plan["effects"] = [effect for effect in plan["effects"] if not (effect.get("type") == "text" and effect.get("factual"))]
+            plan["effects"].append({
+                "id": creative._new_id("e"),
+                "type": "text",
+                "kind": "headline",
+                "text": label,
+                "start": round(max(0.05, moment), 3),
+                "end": round(max(0.05, moment) + 1.2, 3),
+                "fontSize": 96,
+                "factual": True,
+            })
+            studio["factualLabels"] = [label]
+            record(
+                "on-screen text",
+                f"title_structures.number={number:.3f}",
+                f"One factual label '{label}' sits on the peak. It is the measured timestamp, not dialogue.",
+            )
+        else:
+            studio["factualLabels"] = []
+            record("on-screen text", f"title_structures.number={number:.3f}", "The peak is not on the timeline, so no label was drawn.")
+    else:
+        studio["factualLabels"] = list(studio.get("factualLabels") or [])
+        record(
+            "on-screen text",
+            f"title_structures.number={number:.3f}",
+            "No number pattern strong enough. No on-screen text was invented.",
+        )
+
+    creative._retime_from_source(plan)
+    record(
+        "payoff",
+        f"views_available={str(views).lower()}; vintage={vintage}",
+        "This file has no retention curve, so the source ending is kept and the last clip stays at 1.0x or slower.",
+    )
+    record(
+        "rewatch",
+        f"views_available={str(views).lower()}; no retention curve in {vintage}",
+        "No forced loop on v1. If the rendered first 3 seconds are weaker than the later peak, the second pass opens on that measured moment.",
+    )
+    return {"choices": choices, "lines": lines}
+
+
+def measure_output(path: Path, plan: dict, analysis: dict, story: dict) -> dict:
+    """Score the rendered MP4. Weak means a second encode should change pixels."""
+    duration = _media_duration(path)
+    punch = story.get("punch") or {}
+    punch_out = creative._source_to_output(plan, float(punch["t0"])) if punch else None
+    samples = _motion_samples(path, duration, punch_out)
+    rendered_audio = _has_audio_stream(path)
+    source_audio = bool((analysis.get("source") or {}).get("hasAudio"))
+    stats = {
+        "duration": round(duration, 3),
+        "openingMotion": samples["openingMotion"],
+        "laterMotion": samples["laterMotion"],
+        "crossDiff": samples["crossDiff"],
+        "endingLuma": samples["endingLuma"],
+        "framesRead": samples["framesRead"],
+        "punchOut": None if punch_out is None else round(float(punch_out), 3),
+        "renderedAudio": rendered_audio,
+        "sourceAudio": source_audio,
+    }
+    reasons = weakness_reasons(stats, plan, analysis)
+    return {**stats, "weak": bool(reasons), "reasons": reasons}
+
+
+def weakness_reasons(stats: dict, plan: dict, analysis: dict) -> list[str]:
+    reasons = []
+    opening = float(stats.get("openingMotion") or 0)
+    later = float(stats.get("laterMotion") or 0)
+    cross = float(stats.get("crossDiff") or 0)
+    punch_out = stats.get("punchOut")
+    frames = int(stats.get("framesRead") or 0)
+    opening_zoom = _opening_zoom(plan)
+    if frames < 4:
+        reasons.append("rendered frames could not be read, so the opening could not be measured")
+    elif punch_out is not None and float(punch_out) > 3.0 and (
+        later > max(1.0, opening * 1.25) or (cross > 8 and opening_zoom < 1.08)
+    ):
+        reasons.append(
+            f"first 3s motion {opening:.2f} vs later {later:.2f}; "
+            f"frame diff against the peak {cross:.2f}; punch zoom output at {float(punch_out):.2f}s"
+        )
+    if punch_out is not None and float(punch_out) > 3.0 and opening_zoom < 1.08 and frames >= 4 and cross > 8:
+        if not any("punch zoom" in reason for reason in reasons):
+            reasons.append(f"opening zoom is flat ({opening_zoom:.2f}) while the punch lands at {float(punch_out):.2f}s")
+    phrases = creative.supported_phrases(analysis)
+    if phrases and not (plan.get("captions") or []):
+        reasons.append("supported speech has no captions")
+    tracks = [track for track in analysis.get("tracks") or [] if track.get("kind") in ("face", "person")]
+    if tracks and not any(clip.get("focusTrack") for clip in plan.get("clips") or []):
+        reasons.append("crop has no focusTrack although a person track exists")
+    audio = plan.get("audio") or {}
+    if audio.get("music"):
+        reasons.append("music is on")
+    if stats.get("sourceAudio") and stats.get("renderedAudio") is False:
+        reasons.append("audio missing on the rendered file")
+    ending = stats.get("endingLuma")
+    if ending is not None and float(ending) < 8:
+        reasons.append("ending is nearly black")
+    speeds = [float(clip.get("speed") or 1) for clip in plan.get("clips") or []]
+    if speeds and max(speeds) - min(speeds) < 0.04 and punch_out is not None and float(punch_out) > 3 and later > max(1.0, opening * 1.25):
+        reasons.append("pacing is flat while the later picture moves more than the first 3 seconds")
+    if speeds and speeds[-1] > 1.05:
+        reasons.append("payoff plays faster than real time")
+    return reasons
+
+
+def improve_rendered(plan: dict, analysis: dict, story: dict, measure: dict) -> tuple[bool, str]:
+    """Change the plan when the rendered file was weak. Returns whether a re-render differs."""
+    if not measure.get("weak"):
+        return False, ""
+    before = creative._slim(plan, ("clips", "captions", "effects", "audio"))
+    notes = []
+    text = " ".join(measure.get("reasons") or [])
+    if any(token in text for token in ("first 3s", "punch zoom", "opening zoom", "pacing is flat", "frames could not")):
+        ok, message = _promote_peak(plan, analysis, story)
+        if ok:
+            notes.append(message)
+    if "focusTrack" in text:
+        track_id, kind = creative.main_subject(analysis)
+        if track_id:
+            for clip in plan.get("clips") or []:
+                clip["focusTrack"] = track_id
+            notes.append(f"Beskärningen följer {track_id} ({kind}).")
+    if "captions" in text:
+        added = _add_real_captions(plan, analysis)
+        if added:
+            notes.append(added)
+    if "music is on" in text:
+        plan.setdefault("audio", {})["music"] = False
+        plan["audio"]["keepOriginal"] = True
+        notes.append("Musik togs bort. Originalljudet är kvar.")
+    if "audio missing" in text:
+        plan.setdefault("audio", {})["keepOriginal"] = True
+        plan["audio"]["music"] = False
+        notes.append("Nästa render tvingar på originalljudet.")
+    if "nearly black" in text or "payoff plays faster" in text:
+        clips = plan.get("clips") or []
+        if clips and float(clips[-1].get("speed") or 1) > 1.0:
+            clips[-1]["speed"] = 1.0
+            notes.append("Sista klippet spelas i 1.0x.")
+        elif "nearly black" in text:
+            ok, message = creative._satisfying_end(plan)
+            if ok:
+                notes.append(message)
+    if notes:
+        _reseat_factual(plan, story)
+    after = creative._slim(plan, ("clips", "captions", "effects", "audio"))
+    if before == after:
+        return False, ""
+    return True, " ".join(notes)
+
+
+def _promote_peak(plan: dict, analysis: dict, story: dict) -> tuple[bool, str]:
+    punch = story.get("punch") or {}
+    if not punch or not plan.get("clips"):
+        return False, ""
+    t0 = float(punch["t0"])
+    t1 = float(punch["t1"])
+    if t1 - t0 < 0.45:
+        return False, ""
+    first = plan["clips"][0]
+    if abs(float(first.get("sourceStart") or 0) - t0) < 0.25:
+        return False, ""
+    _clock_to_source(plan)
+    track_id, kind = creative.main_subject(analysis)
+    opening = copy.deepcopy(first)
+    opening["id"] = creative._new_id("c")
+    opening["sourceStart"] = round(t0, 3)
+    opening["sourceEnd"] = round(t1, 3)
+    opening["speed"] = 1.0
+    opening["zoomStart"] = round(float(punch.get("zoomStart") or 1.10), 3)
+    opening["zoomEnd"] = round(float(punch.get("zoomEnd") or 1.18), 3)
+    opening["label"] = "peak"
+    opening["reason"] = "Second pass moved the measured motion peak to the opening because the rendered first 3 seconds were weaker."
+    if track_id:
+        opening["focusTrack"] = track_id
+    rest = []
+    for clip in plan["clips"]:
+        rest.extend(creative._subtract_clip(clip, t0, t1))
+    plan["clips"] = [opening, *rest]
+    _clock_from_source(plan)
+    if kind == "face":
+        who = f"ansiktsspåret {track_id}"
+    elif kind == "person":
+        who = f"kroppsspåret {track_id}"
+    else:
+        who = "mitten, eftersom inget personspår finns"
+    return True, (
+        f"Andra passet flyttade det uppmätta rörelsefönstret {t0:.2f}–{t1:.2f}s till öppningen "
+        f"med zoom {opening['zoomStart']:.2f}–{opening['zoomEnd']:.2f}. Det är inte en bekräftad reaktion. Fokus: {who}."
+    )
+
+
+def _reseat_factual(plan: dict, story: dict) -> None:
+    labels = list((plan.get("studio") or {}).get("factualLabels") or [])
+    if not labels:
+        return
+    text = str(labels[0])
+    punch = story.get("punch") or {}
+    peak = story.get("peak") or {}
+    moment = None
+    if punch:
+        moment = creative._source_to_output(plan, float(punch.get("t0") or 0))
+    if moment is None and peak:
+        moment = creative._source_to_output(plan, float(peak.get("t") or 0))
+    if moment is None:
+        moment = 0.12
+    plan["effects"] = [effect for effect in plan.get("effects") or [] if not (effect.get("type") == "text" and effect.get("factual"))]
+    plan.setdefault("effects", []).append({
+        "id": creative._new_id("e"),
+        "type": "text",
+        "kind": "headline",
+        "text": text,
+        "start": round(max(0.05, float(moment)), 3),
+        "end": round(max(0.05, float(moment)) + 1.2, 3),
+        "fontSize": 96,
+        "factual": True,
+    })
+    plan.setdefault("studio", {})["factualLabels"] = [text]
+
+
+def _add_real_captions(plan: dict, analysis: dict) -> str:
+    phrases = creative.supported_phrases(analysis)
+    if not phrases or plan.get("captions"):
+        return ""
+    for phrase in phrases:
+        start = creative._source_to_output(plan, float(phrase["t0"]))
+        end = creative._source_to_output(plan, float(phrase["t1"]))
+        if start is None or end is None or end - start < 0.2:
+            continue
+        plan.setdefault("captions", []).append({
+            "id": creative._new_id("cap"),
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": phrase["text"],
+            "accent": "",
+            "fontSize": 64,
+        })
+    if not plan.get("captions"):
+        return ""
+    return "Undertexter lades in från de godkända replikerna."
+
+
+def _clock_to_source(plan: dict) -> None:
+    for caption in plan.get("captions") or []:
+        src0 = creative._output_to_source(plan, float(caption["start"]))
+        src1 = creative._output_to_source(plan, float(caption["end"]))
+        if src0 is None or src1 is None:
+            caption["_drop"] = True
+            continue
+        caption["start"] = src0
+        caption["end"] = src1
+    plan["captions"] = [caption for caption in plan.get("captions") or [] if not caption.get("_drop")]
+    for effect in plan.get("effects") or []:
+        if effect.get("type") == "sound_effect":
+            src = creative._output_to_source(plan, float(effect.get("time") or 0))
+            if src is None:
+                effect["_drop"] = True
+            else:
+                effect["time"] = src
+                effect["_src"] = True
+            continue
+        if "start" not in effect:
+            continue
+        src0 = creative._output_to_source(plan, float(effect["start"]))
+        src1 = creative._output_to_source(plan, float(effect["end"]))
+        if src0 is None or src1 is None:
+            effect["_drop"] = True
+            continue
+        effect["start"] = src0
+        effect["end"] = src1
+        effect["_src"] = True
+
+
+def _clock_from_source(plan: dict) -> None:
+    creative._retime_from_source(plan)
+    kept = []
+    for effect in plan.get("effects") or []:
+        if effect.get("_drop"):
+            continue
+        if effect.get("type") == "sound_effect" and effect.get("_src"):
+            out = creative._source_to_output(plan, float(effect.get("time") or 0))
+            effect.pop("_src", None)
+            if out is None:
+                continue
+            effect["time"] = round(max(0.0, out), 3)
+            kept.append(effect)
+            continue
+        if effect.get("_src") and "start" in effect:
+            start = creative._source_to_output(plan, float(effect["start"]))
+            end = creative._source_to_output(plan, float(effect["end"]))
+            effect.pop("_src", None)
+            if start is None or end is None or end - start < 0.12:
+                continue
+            effect["start"] = round(start, 3)
+            effect["end"] = round(end, 3)
+        kept.append(effect)
+    plan["effects"] = kept
+
+
+def _opening_zoom(plan: dict) -> float:
+    zoom = 1.0
+    cursor = 0.0
+    for clip in plan.get("clips") or []:
+        speed = float(clip.get("speed") or 1)
+        start, end = float(clip["sourceStart"]), float(clip["sourceEnd"])
+        out_dur = float(clip.get("holdSec") or 0.3) if speed <= 0.001 else max(0.0, (end - start) / max(speed, 0.001))
+        if cursor < 3.0 and cursor + out_dur > 0.05:
+            zoom = max(zoom, float(clip.get("zoomEnd") or 1))
+        cursor += out_dur
+        if cursor >= 3.0:
+            break
+    return zoom
+
+
+def _motion_samples(path: Path, duration: float, punch_out: float | None) -> dict:
+    empty = {"openingMotion": 0.0, "laterMotion": 0.0, "crossDiff": 0.0, "endingLuma": None, "framesRead": 0}
+    if duration <= 0.4 or not path.exists():
+        return empty
+    try:
+        import numpy as np
+        from PIL import Image
+    except Exception:
+        return empty
+    times = [moment for moment in (0.2, 0.8, 1.5, 2.2, 2.8, 4.0, 6.0, 8.0, 9.5, 10.5) if moment < duration - 0.08]
+    if punch_out is not None and 0.3 < float(punch_out) < duration - 0.08:
+        times.append(round(float(punch_out), 2))
+    if duration > 0.6:
+        times.append(round(max(0.2, duration - 0.35), 2))
+    times = sorted(set(times))
+    frames: list[tuple[float, object]] = []
+    with tempfile.TemporaryDirectory(prefix="capcut-critique-") as tmp:
+        folder = Path(tmp)
+        for index, moment in enumerate(times):
+            dest = folder / f"f{index}.jpg"
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-ss", f"{moment:.2f}", "-i", str(path), "-frames:v", "1", "-vf", "scale=160:284", str(dest)],
+                capture_output=True,
+            )
+            if not dest.exists():
+                continue
+            frames.append((moment, np.asarray(Image.open(dest).convert("RGB"), dtype=np.float32)))
+    if len(frames) < 2:
+        return empty
+    diffs = []
+    for (left_t, left), (right_t, right) in zip(frames, frames[1:]):
+        diffs.append((left_t, right_t, float(np.abs(left - right).mean())))
+    opening = [value for _left, right, value in diffs if right < 3.05]
+    later = [value for left, _right, value in diffs if left >= 3.0]
+    opening_motion = float(sum(opening) / len(opening)) if opening else 0.0
+    later_motion = float(sum(later) / len(later)) if later else 0.0
+    cross = 0.0
+    early = next((image for moment, image in frames if moment <= 1.0), frames[0][1])
+    if punch_out is not None:
+        target = min(frames, key=lambda item: abs(item[0] - float(punch_out)))
+        cross = float(np.abs(early - target[1]).mean())
+    ending_luma = float(frames[-1][1].mean())
+    return {
+        "openingMotion": round(opening_motion, 3),
+        "laterMotion": round(later_motion, 3),
+        "crossDiff": round(cross, 3),
+        "endingLuma": round(ending_luma, 2),
+        "framesRead": len(frames),
+    }
+
+
+def _media_duration(path: Path) -> float:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        return float(proc.stdout.strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+def _has_audio_stream(path: Path) -> bool:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    return bool(proc.stdout.strip())
 
 
 def _shape(plan: dict, analysis: dict, story: dict) -> list[str]:
@@ -467,9 +984,12 @@ def _edges(image) -> float:
 
 def _invented_caption(plan: dict, analysis: dict) -> bool:
     phrases = [creative.fold(row["text"]) for row in creative.supported_phrases(analysis)]
+    allowed = creative._factual_tokens(plan)
     for text in creative._texts(plan):
         token = creative.fold(text)
         if not token:
+            continue
+        if token in allowed:
             continue
         if any(token in phrase or phrase in token for phrase in phrases):
             continue
@@ -550,6 +1070,8 @@ def _public_trends(trends: dict) -> dict:
         "common_title_patterns": trends.get("common_title_patterns"),
         "recommended_hook_patterns": trends.get("recommended_hook_patterns"),
         "views_available": trends.get("views_available"),
+        "title_structures": trends.get("title_structures") or {},
+        "title_length_median": trends.get("title_length_median"),
         "as_of": trends.get("as_of"),
         "note": trends.get("note"),
         "credentialNeeded": trends.get("credentialNeeded"),

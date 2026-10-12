@@ -7,13 +7,23 @@ Phone delivery is 1080x1920. Set SHORT_DELIVERY=4k for the labeled upscale.
 from __future__ import annotations
 
 import copy
+import json
 
 from .config import SHORT_DELIVERY
 from .creative import parse_intent, revise, track_view
 from .export_spec import SHORT_EXPORT, describe_export
 from .ffmpeg_util import probe
 from .render import render_plan
-from .studio import apply_feedback_now, apply_studio, finish_metadata, format_reply, parse_feedback, review_frames, store_feedback
+from .studio import (
+    apply_feedback_now,
+    apply_studio,
+    finish_metadata,
+    format_reply,
+    improve_rendered,
+    measure_output,
+    parse_feedback,
+    store_feedback,
+)
 
 
 def render_first_short(project, prompt: str, on_event) -> dict:
@@ -34,6 +44,7 @@ def render_first_short(project, prompt: str, on_event) -> dict:
         raise RuntimeError(edited.get("error") or "Planen kunde inte byggas.")
     on_event("status", {"step": "trends"})
     edited = apply_studio(analysis, edited, prompt, project, first=True)
+    on_event("edits", {"changes": edited.get("changes") or [], "skipped": []})
     return _commit(project, analysis, edited, on_event, prompt, first=True)
 
 
@@ -152,6 +163,42 @@ def _commit(project, analysis: dict, edited: dict, on_event, instruction: str, f
 
 def _render(project, plan: dict, view: dict, analysis: dict, on_event, edited: dict | None = None, instruction: str = "", first: bool = False) -> dict:
     on_event("status", {"step": "render"})
+    saved = _produce(project, plan, view, analysis, on_event, edited, instruction)
+    story = (edited or {}).get("story") or {}
+    if not first or not story:
+        return saved
+    on_event("status", {"step": "critique"})
+    on_event("version", {"activeVersion": saved["version"]})
+    measured = measure_output(project.folder / "versions" / f"v{saved['version']}" / "output.mp4", plan, analysis, story)
+    _stamp(project, saved["version"], plan, measured, "v1 är sparad och mätt.", second=False)
+    on_event("edits", {"changes": [_measure_line(measured)], "skipped": []})
+    if not measured.get("weak"):
+        return saved
+    revised = copy.deepcopy(plan)
+    changed, note = improve_rendered(revised, analysis, story, measured)
+    if not changed:
+        note = "Mätningen var svag, men ingen ärlig ändring fanns att rendera om. v1 ligger kvar."
+        _stamp(project, saved["version"], plan, measured, note, second=False)
+        on_event("edits", {"changes": [note], "skipped": []})
+        return saved
+    revised.setdefault("studio", {})
+    revised["studio"]["measure"] = measured
+    revised["studio"]["secondPass"] = True
+    revised["studio"]["critiqueNote"] = note
+    revised["studio"]["parentVersion"] = saved["version"]
+    on_event("edits", {"changes": [note], "skipped": []})
+    on_event("status", {"step": "render"})
+    try:
+        return _produce(project, revised, view, analysis, on_event, edited, instruction)
+    except Exception as error:
+        failed = f"v2 kunde inte renderas ({error}). v1 ligger kvar."
+        _stamp(project, saved["version"], plan, measured, failed, second=False)
+        on_event("edits", {"changes": [failed], "skipped": []})
+        saved["plan"] = plan
+        return saved
+
+
+def _produce(project, plan: dict, view: dict, analysis: dict, on_event, edited: dict | None, instruction: str) -> dict:
     version, folder = project.next_version_folder()
     out = folder / "output.mp4"
     delivery = SHORT_EXPORT if SHORT_DELIVERY in {"4k", "4k60", "short"} else None
@@ -165,26 +212,10 @@ def _render(project, plan: dict, view: dict, analysis: dict, on_event, edited: d
         on_progress=lambda progress: on_event("progress", {"progress": round(progress, 3)}),
         delivery=delivery,
     )
-    story = (edited or {}).get("story") or {}
-    trends = (edited or {}).get("trends") or {}
-    if story:
-        plan, critique, changed = review_frames(out, plan, analysis, story, trends, first=first)
-        if changed:
-            on_event("status", {"step": "render"})
-            probe_info = render_plan(
-                project.original,
-                view,
-                plan,
-                out,
-                on_progress=lambda progress: on_event("progress", {"progress": round(progress, 3)}),
-                delivery=delivery,
-            )
-            plan.setdefault("studio", {})["secondPass"] = True
-            plan["studio"]["critique"] = critique
-        else:
-            plan.setdefault("studio", {})["critique"] = critique
     on_event("status", {"step": "qa"})
     qa = _qa(out, plan, analysis, delivery)
+    story = (edited or {}).get("story") or {}
+    trends = (edited or {}).get("trends") or {}
     if story:
         finish_metadata(plan, analysis, story, trends, plan.get("studio", {}).get("critique") or {}, probe_info, qa, instruction)
         gate = (plan.get("studio") or {}).get("gate") or {}
@@ -197,7 +228,32 @@ def _render(project, plan: dict, view: dict, analysis: dict, on_event, edited: d
         ))
     saved = project.save_version(version, plan, probe_info, qa)
     saved["plan"] = plan
+    saved["output"] = str(out)
     return saved
+
+
+def _stamp(project, version: int, plan: dict, measured: dict, note: str, *, second: bool) -> None:
+    studio = plan.setdefault("studio", {})
+    studio["measure"] = measured
+    studio["secondPass"] = second
+    studio["critiqueNote"] = note
+    path = project.folder / "versions" / f"v{version}" / "plan.json"
+    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2))
+    for item in project.editor.versions:
+        if item["version"] == version:
+            item["plan"] = copy.deepcopy(plan)
+    if project.editor.active == version:
+        project.editor.plan = copy.deepcopy(plan)
+    project.save()
+
+
+def _measure_line(measured: dict) -> str:
+    reasons = "; ".join(measured.get("reasons") or [])
+    state = "svag" if measured.get("weak") else "inte svag"
+    return (
+        f"Kritik ({state}): första 3s rörelse {measured.get('openingMotion')}, "
+        f"senare {measured.get('laterMotion')}, topp i output {measured.get('punchOut')}s. {reasons}"
+    ).strip()
 
 
 def _qa(path, plan: dict, analysis: dict, delivery: dict | None) -> dict:

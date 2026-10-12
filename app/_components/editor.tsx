@@ -28,6 +28,8 @@ const STEP_LABELS: Record<string, string> = {
   storyboard: "Bygger storyboard",
   render: "Renderar MP4",
   qa: "Kontrollerar filen",
+  trends: "Läser trendmönster",
+  critique: "Granskar den renderade filen",
   upload: "Laddar upp",
 };
 
@@ -173,7 +175,15 @@ export function Editor() {
           });
           if (names.length) setLog((current) => [...current, `Kontroll: ${names.join(", ")}`]);
         }
-        if (event === "version" && data.activeVersion) setView(Number(data.activeVersion));
+        if (event === "version" && data.activeVersion) {
+          const version = Number(data.activeVersion);
+          setView(version);
+          setProject((current) => {
+            if (!current) return current;
+            if (current.versions.some((item) => item.version === version)) return { ...current, activeVersion: version };
+            return { ...current, activeVersion: version, versions: [...current.versions, { version }] };
+          });
+        }
         if (event === "error") {
           failed = true;
           setError(String(data.message || "Något gick fel."));
@@ -196,6 +206,25 @@ export function Editor() {
       setBusy(false);
       setStep("");
       setProgress(null);
+    }
+  }
+
+  async function undoLast() {
+    if (!project || busy || !project.activeVersion || project.activeVersion < 2) return;
+    setError("");
+    setBusy(true);
+    try {
+      const response = await fetch(workerUrl(`projects/${project.id}/undo`), { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(messageOf(payload, "Kunde inte ångra."));
+      const result = (payload as { result?: { ok?: boolean; error?: string } }).result;
+      if (result && result.ok === false) throw new Error(result.error || "Det finns ingen tidigare version att ångra.");
+      const next = await refresh(project.id);
+      if (next.activeVersion) setView(next.activeVersion);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Kunde inte ångra.");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -318,10 +347,21 @@ export function Editor() {
             ))}
           </div>
           {typeof view === "number" ? (
-            <Button className="h-12 bg-[#FF2D2D] text-base text-white hover:bg-[#ff4545]" onClick={() => void download()} type="button">
-              <DownloadIcon className="size-4" />
-              Ladda ner MP4
-            </Button>
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <Button className="h-12 flex-1 bg-[#FF2D2D] text-base text-white hover:bg-[#ff4545]" onClick={() => void download()} type="button">
+                <DownloadIcon className="size-4" />
+                Ladda ner MP4
+              </Button>
+              <Button
+                className="h-12 border-white/20 bg-transparent text-white hover:bg-white/10"
+                disabled={busy || (project?.activeVersion ?? 0) < 2}
+                onClick={() => void undoLast()}
+                type="button"
+                variant="outline"
+              >
+                Ångra
+              </Button>
+            </div>
           ) : null}
           {filename ? <p className="text-sm text-white/50">{filename}</p> : null}
           <input

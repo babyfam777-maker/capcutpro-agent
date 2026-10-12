@@ -54,7 +54,35 @@ def status() -> dict:
 
 
 def analyze_trending_data(topic: str = "", category: str | None = None, region: str = "US") -> dict:
-    """Return pattern stats for one region. Historical and current stay separate."""
+    """Return pattern stats for one region. Never raises and never waits on Kaggle."""
+    try:
+        return _analyze_trending_data(topic, category, region)
+    except Exception as error:
+        return {
+            "trend_score": 0,
+            "topic_interest": 0,
+            "common_title_patterns": [],
+            "high_performing_patterns": [],
+            "recommended_hook_patterns": [],
+            "recommended_packaging": {"note": _NOTE},
+            "confidence": 0,
+            "vintage": "fallback",
+            "region": (region or "US").upper(),
+            "region_used": None,
+            "source": None,
+            "as_of": None,
+            "rows": 0,
+            "views_available": False,
+            "title_structures": {},
+            "title_length_median": None,
+            "historical": None,
+            "current": None,
+            "note": f"Trendfilen kunde inte läsas ({error}). Klippningen fortsätter utan trenddata. {_NOTE}",
+            "credentialNeeded": CREDENTIAL,
+        }
+
+
+def _analyze_trending_data(topic: str = "", category: str | None = None, region: str = "US") -> dict:
     region = (region or "US").upper()
     current = _region_stats("current", region)
     historical = _region_stats("historical", region) or _bundled()
@@ -91,6 +119,8 @@ def analyze_trending_data(topic: str = "", category: str | None = None, region: 
         "as_of": primary.get("date_max"),
         "rows": primary.get("rows") or 0,
         "views_available": bool(primary.get("views")),
+        "title_structures": primary.get("title_structures") or {},
+        "title_length_median": (primary.get("title_length") or {}).get("median"),
         "historical": _public_summary(historical),
         "current": _public_summary(current),
         "note": _NOTE,
