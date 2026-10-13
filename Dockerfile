@@ -13,11 +13,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OPENAI_API_KEY=ollama \
     MODEL=qwen2.5:3b \
     LLM_ALLOW_REMOTE=0 \
-    LLM_TIMEOUT=15
+    LLM_TIMEOUT=15 \
+    OMP_NUM_THREADS=1 \
+    OMP_THREAD_LIMIT=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MALLOC_ARENA_MAX=2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl xz-utils ffmpeg fonts-noto-core fonts-noto-color-emoji \
-      libegl1 libgl1 libgomp1 \
+      libegl1 libgles2 libgl1 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install a Node.js LTS release alongside Python for the combined free service.
