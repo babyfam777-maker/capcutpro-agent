@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: capcutpro-agent
+    name: cupcat-free
     runtime: docker
     plan: free
     region: frankfurt
