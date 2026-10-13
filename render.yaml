@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: capcutpro-agent
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /
+    envVars:
+      - key: DATA_DIR
+        value: /tmp/cupcat-data
+      - key: WORKER_URL
+        value: http://127.0.0.1:8787
+      - key: WHISPER_MODEL
+        value: tiny
+      - key: OPENAI_BASE_URL
+        value: http://127.0.0.1:11434/v1
+      - key: OPENAI_API_KEY
+        value: ollama
+      - key: MODEL
+        value: qwen2.5:3b
+      - key: LLM_ALLOW_REMOTE
+        value: "0"
