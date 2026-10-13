@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 import subprocess
 import urllib.request
 from pathlib import Path
@@ -116,22 +117,39 @@ def build_video_analysis(path: Path, sha256: str | None = None, on_step=None) ->
     if duration <= 0:
         raise RuntimeError("Videons längd kunde inte läsas från filen. Ingen analys v2 skapas.")
 
+    lite_mode = os.environ.get("CUPCAT_LITE_MODE", "").strip().lower() in {"1", "true", "yes"}
     scenes = timed("scenes", lambda: _scenes(path, duration, unavailable))
-    motion_series, motion_evidence = timed("motion", lambda: _motion(path, meta, unavailable))
-    face_tracks, face_events = timed("faces", lambda: _faces(path, meta, unavailable))
-    haar_used = False
-    if not face_tracks:
-        haar_tracks = timed("faces_opencv", lambda: _faces_opencv(path, meta, unavailable))
-        if haar_tracks:
-            haar_used = True
-            face_tracks = haar_tracks
-            face_events = [_haar_face_event(track) for track in haar_tracks]
-    pose_used = False
-    pose_tracks: list[dict] = []
-    if not face_tracks:
-        pose_tracks = timed("pose", lambda: _poses(path, meta, unavailable))
-        pose_used = bool(pose_tracks)
-    hand_tracks, hand_events = timed("hands", lambda: _hands(path, meta, face_tracks, unavailable))
+    if lite_mode:
+        # Render Free has a tight memory ceiling. Avoid dense optical flow and
+        # MediaPipe model sessions; low-rate frame differences + Haar still
+        # give the editor real, explicitly limited visual evidence.
+        motion_series, motion_evidence = timed("motion", lambda: _motion_lite(path, meta, unavailable))
+        face_tracks = timed(
+            "faces_opencv",
+            lambda: _faces_opencv(path, meta, unavailable, sample_fps=2, max_side=320),
+        )
+        face_events = [_haar_face_event(track, sample_fps=2) for track in face_tracks]
+        haar_used = bool(face_tracks)
+        pose_used = False
+        pose_tracks: list[dict] = []
+        hand_tracks: list[dict] = []
+        hand_events: list[dict] = []
+    else:
+        motion_series, motion_evidence = timed("motion", lambda: _motion(path, meta, unavailable))
+        face_tracks, face_events = timed("faces", lambda: _faces(path, meta, unavailable))
+        haar_used = False
+        if not face_tracks:
+            haar_tracks = timed("faces_opencv", lambda: _faces_opencv(path, meta, unavailable))
+            if haar_tracks:
+                haar_used = True
+                face_tracks = haar_tracks
+                face_events = [_haar_face_event(track) for track in haar_tracks]
+        pose_used = False
+        pose_tracks = []
+        if not face_tracks:
+            pose_tracks = timed("pose", lambda: _poses(path, meta, unavailable))
+            pose_used = bool(pose_tracks)
+        hand_tracks, hand_events = timed("hands", lambda: _hands(path, meta, face_tracks, unavailable))
     raw = timed("whisper", lambda: _read_transcript(path, bool(meta.get("hasAudio")), unavailable))
     prepared: dict = {}
 
@@ -262,7 +280,7 @@ def build_video_analysis(path: Path, sha256: str | None = None, on_step=None) ->
         "evidence": evidence,
         "phrases": phrase_docs,
         "transcript": transcript,
-        "limitations": _limitations(haar_used, pose_used),
+        "limitations": _limitations(haar_used, pose_used) + (["Render Free low-memory mode: rörelse mäts med bildskillnad och ansikten med lågupplöst OpenCV Haar; MediaPipe-ansiktslandmärken, handspår och pose-spår är avstängda."] if lite_mode else []),
         "motion": motion_series,
         "audioBins": bins,
         "unavailable": unavailable,
@@ -797,6 +815,54 @@ def _motion(path: Path, meta: dict, unavailable: list[dict]) -> tuple[list[dict]
     return series, evidence
 
 
+def _motion_lite(path: Path, meta: dict, unavailable: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Memory-light motion estimate for Render Free; not optical flow or action recognition."""
+    try:
+        import cv2
+    except Exception as error:
+        _unavailable(unavailable, "frame_difference", error)
+        return [], []
+    width, height = _proxy_size(meta, max_side=192)
+    series: list[dict] = []
+    previous = None
+    try:
+        for index, frame in enumerate(_frames(path, 2, width, height)):
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            moment = round(index / 2, 3)
+            if previous is not None:
+                energy = float(np.mean(cv2.absdiff(gray, previous))) / 255.0
+                series.append({
+                    "t": moment,
+                    "energy": round(energy, 4),
+                    "dx": 0.0,
+                    "dy": 0.0,
+                    "dirX": 0.0,
+                    "dirY": 0.0,
+                })
+            previous = gray
+    except Exception as error:
+        _unavailable(unavailable, "frame_difference", error)
+        return series, []
+    if len(series) < 4:
+        return series, []
+    values = sorted(item["energy"] for item in series)
+    cutoff = max(0.035, values[int(0.9 * (len(values) - 1))])
+    evidence = []
+    for item in series:
+        if item["energy"] < cutoff:
+            continue
+        evidence.append({
+            "type": "motion",
+            "t0": item["t"],
+            "t1": round(min(float(meta["duration"]), item["t"] + 0.5), 3),
+            "trackId": None,
+            "confidence": round(min(1.0, item["energy"] / cutoff * 0.5), 3),
+            "source": "frame_difference",
+            "payload": {"energy": item["energy"], "dx": 0.0, "dy": 0.0, "dirX": 0.0, "dirY": 0.0},
+        })
+    return series, evidence
+
+
 def _limitations(haar_used: bool, pose_used: bool = False) -> list[str]:
     limits = list(FACE_HAND_LIMITATIONS)
     if haar_used:
@@ -811,11 +877,11 @@ def _limitations(haar_used: bool, pose_used: bool = False) -> list[str]:
     return limits
 
 
-def _haar_face_event(track: dict) -> dict:
+def _haar_face_event(track: dict, sample_fps: float = SAMPLE_FPS) -> dict:
     return {
         "type": "face_track",
         "t0": round(float(track["samples"][0]["t"]), 3),
-        "t1": round(float(track["samples"][-1]["t"]) + 1 / SAMPLE_FPS, 3),
+        "t1": round(float(track["samples"][-1]["t"]) + 1 / sample_fps, 3),
         "trackId": track["id"],
         "confidence": 0.45,
         "source": "opencv_haar",
@@ -823,7 +889,7 @@ def _haar_face_event(track: dict) -> dict:
     }
 
 
-def _faces_opencv(path: Path, meta: dict, unavailable: list[dict]) -> list[dict]:
+def _faces_opencv(path: Path, meta: dict, unavailable: list[dict], sample_fps: float = SAMPLE_FPS, max_side: int = 480) -> list[dict]:
     """Frontal-face boxes when MediaPipe is missing or returns nothing. Not a smile or a hand."""
     try:
         import cv2
@@ -834,12 +900,12 @@ def _faces_opencv(path: Path, meta: dict, unavailable: list[dict]) -> list[dict]
     if cascade.empty():
         _unavailable(unavailable, "opencv_haar", "Haar-kaskaden saknas.")
         return []
-    width, height = _proxy_size(meta, max_side=480)
+    width, height = _proxy_size(meta, max_side=max_side)
     detections: list[tuple[float, list[dict]]] = []
     try:
         index = 0
-        for frame in _frames(path, SAMPLE_FPS, width, height):
-            moment = index / SAMPLE_FPS
+        for frame in _frames(path, sample_fps, width, height):
+            moment = index / sample_fps
             gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             rects = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(28, 28))
             boxes = []
