@@ -14,6 +14,8 @@ services:
         value: http://127.0.0.1:8787
       - key: WHISPER_MODEL
         value: tiny
+      - key: CUPCAT_LITE_MODE
+        value: "1"
       - key: OPENAI_BASE_URL
         value: http://127.0.0.1:11434/v1
       - key: OPENAI_API_KEY
