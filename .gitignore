@@ -3,6 +3,11 @@ node_modules
 .eve
 .vercel
 .next
+data/
+worker/.venv/
+worker/assets/sfx/
+**/__pycache__/
+.pytest_cache/
 .output
 .nitro
 dist

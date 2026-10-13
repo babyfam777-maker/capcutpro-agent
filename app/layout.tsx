@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import type { ReactNode } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -20,14 +20,21 @@ const mono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "capcutpro",
-  description: "A Next.js starter for eve agents with AI Elements.",
+  title: "CAPCUTPRO / VIRAL SHORT EDITOR",
+  description: "Ladda upp en video, skriv vad shortsen ska handla om, och få en färdig MP4.",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: "#0c0c0c",
 };
 
 // The page and Eve routes validate the generated app's Better Auth session.
 export default function RootLayout({ children }: { readonly children: ReactNode }) {
   return (
-    <html className={cn(sans.variable, mono.variable)} lang="en">
+    <html className={cn(sans.variable, mono.variable)} lang="sv">
       <body>
         <TooltipProvider>{children}</TooltipProvider>
       </body>
