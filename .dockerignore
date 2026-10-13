@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+.next
+data
+worker/.venv
+worker/tests
+worker/scripts
+worker/assets/sfx
+**/__pycache__
+.pytest_cache
+.env
+.env.*
+*.tsbuildinfo
+.DS_Store
