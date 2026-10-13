@@ -8,6 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NODE_ENV=production \
     DATA_DIR=/tmp/cupcat-data \
     WHISPER_MODEL=tiny \
+    CUPCAT_LITE_MODE=1 \
     WORKER_URL=http://127.0.0.1:8787 \
     OPENAI_BASE_URL=http://127.0.0.1:11434/v1 \
     OPENAI_API_KEY=ollama \
