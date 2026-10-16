@@ -1,17 +1,24 @@
 # CupCat: gratis Render-deployment
 
-## Publicera
-1. Open Render and choose **New → Blueprint**.
-2. Connect this GitHub repository: `babyfam777-maker/capcutpro-agent`.
-3. Select branch `main` after PR #9 is merged, then apply the Blueprint.
-4. Choose the **Free** plan if Render shows a plan selector.
+CupCat runs as two separate **Free** Render web services so the Next.js interface does not share its 512 MB memory limit with Python, Whisper, and FFmpeg.
 
-The Blueprint creates one Docker web service named `cupcat-free`. It serves the Next.js UI on Render's assigned `PORT` and runs the FastAPI/FFmpeg worker on loopback port 8787. The worker is not exposed publicly.
+## Services
+- `cupcat-free`: Next.js chat UI, using the public worker URL built into the client.
+- `cupcat-worker`: FastAPI + FFmpeg + faster-whisper in low-memory mode.
 
-## Gratisnivåns begränsningar
-- The service may spin down after inactivity and cold starts can take a while.
-- Render's free filesystem is temporary. Uploaded and rendered video files may disappear after a restart or redeploy.
-- Free compute has a tight memory budget. Large/long videos may fail or be killed.
-- No paid AI API or API key is configured. The container does not run a local Ollama 3B model because that is too large for the free service; when Ollama is unavailable, the existing worker uses its explicit rule-based fallback. Natural-language understanding is therefore limited compared with the local Colab setup.
+## Apply changes
+1. Open the Blueprint in Render.
+2. Select **Manual sync** and apply the current `main` branch configuration.
+3. Wait until both `cupcat-free` and `cupcat-worker` show **Live**.
+4. Open `https://cupcat-free.onrender.com`.
 
-This deploy configuration does not claim the application has passed a hosted render test. The public service URL is assigned by Render after deployment.
+No paid provider or API key is configured. Ollama is **not** running in Render, so unrestricted natural-language AI is not available there; the deterministic editor rules are used when the model server is absent.
+
+## Important free-tier limitations
+- Render Free has 512 MB RAM and 0.1 CPU per web service.
+- The low-memory worker uses Whisper's confidence/language checks but skips MediaPipe, dense optical flow, and the separate YAMNet classifier.
+- The local filesystem is temporary. A service restart, redeploy, or idle spin-down can erase uploaded projects and rendered versions.
+- Large or long videos may still fail or take a long time on 0.1 CPU.
+- The first worker request may take a minute or longer while a sleeping instance wakes up.
+
+This setup aims to keep the app from crashing because the UI and renderer compete for memory. It does **not** claim that hosted rendering has been verified until a new MP4 is generated and played on the live service.
