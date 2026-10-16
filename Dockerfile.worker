@@ -1,0 +1,26 @@
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DATA_DIR=/tmp/cupcat-data \
+    WHISPER_MODEL=tiny \
+    CUPCAT_LITE_MODE=1 \
+    OMP_NUM_THREADS=1 \
+    OMP_THREAD_LIMIT=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MALLOC_ARENA_MAX=2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg fonts-noto-core fonts-noto-color-emoji libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY worker/requirements-render.txt ./requirements.txt
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir -r requirements.txt
+
+COPY worker/app ./app
+COPY worker/assets ./assets
+
+EXPOSE 10000
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}"]
