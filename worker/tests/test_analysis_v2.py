@@ -142,6 +142,40 @@ def test_music_laughter_and_foreign_text_are_not_usable_speech():
     assert supported_words(unsure) == []
 
 
+def test_low_memory_mode_allows_only_confident_whisper_text_without_audio_classifier():
+    words = [_word("You", 0.6, 0.9), _word("look", 0.9, 1.2)]
+    segment = _segment("You look", words)
+
+    normal = gate_transcript(
+        [segment],
+        language="en",
+        language_probability=0.97,
+        profiles=[None],
+    )
+    assert normal[0]["status"] == "UNCERTAIN"
+
+    lite = gate_transcript(
+        [segment],
+        language="en",
+        language_probability=0.97,
+        profiles=[None],
+        allow_whisper_only=True,
+    )
+    assert lite[0]["status"] == "SUPPORTED"
+    assert [word["text"] for word in supported_words(lite)] == ["You", "look"]
+    assert any("Lågminnesläge" in reason for reason in lite[0]["reasons"])
+
+    noisy = gate_transcript(
+        [_segment("You look", words, noSpeechProb=0.95)],
+        language="en",
+        language_probability=0.97,
+        profiles=[None],
+        allow_whisper_only=True,
+    )
+    assert noisy[0]["status"] == "REJECTED"
+    assert supported_words(noisy) == []
+
+
 def test_supported_english_can_be_planned_and_rejected_text_cannot():
     words = [_word("You", 0.6, 0.9), _word("look", 0.9, 1.2), _word("beautiful", 1.2, 1.8)]
     rows = gate_transcript(
