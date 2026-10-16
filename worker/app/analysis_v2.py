@@ -160,6 +160,14 @@ def build_video_analysis(path: Path, sha256: str | None = None, on_step=None) ->
             prepared["hop"] = 0.48
             return
         audio = _load_audio(path)
+        if lite_mode:
+            # Do not load the extra YAMNet ONNX model on Render's 512 MB free
+            # instance. Whisper's segment scores remain available for captions;
+            # RMS/onset analysis runs on the already-decoded mono audio.
+            prepared["audio"] = audio
+            prepared["scores"] = None
+            prepared["hop"] = 0.48
+            return
         scores = _yamnet_scores(audio, unavailable)
         hop = 0.48
         if scores is not None and len(scores) and len(audio):
@@ -182,6 +190,7 @@ def build_video_analysis(path: Path, sha256: str | None = None, on_step=None) ->
         language=raw.get("language"),
         language_probability=raw.get("languageProbability"),
         profiles=profiles,
+        allow_whisper_only=lite_mode,
     )
     words = supported_words(transcript)
     phrases = segment_phrases(words, scene_times=scenes)
@@ -372,11 +381,13 @@ def gate_transcript(
     language: str | None,
     language_probability: float | None,
     profiles: list[dict | None] | None,
+    allow_whisper_only: bool = False,
 ) -> list[dict]:
     """Mark each Whisper segment SUPPORTED, UNCERTAIN, or REJECTED.
 
-    Whisper is not usable by itself. A missing audio profile cannot be SUPPORTED.
-    Music, laughter, applause, crowd and other non-speech reject the words.
+    Without an audio classifier, captions are only allowed in explicitly opted-in
+    low-memory mode, and still must pass Whisper's language/confidence/no-speech
+    checks. Normal mode requires an independent speech/non-speech audio profile.
     """
     rows = []
     for index, segment in enumerate(segments):
@@ -420,9 +431,14 @@ def gate_transcript(
         speech = nonspeech = None
         nonspeech_name = None
         if profile is None:
-            if status == "SUPPORTED":
-                status = "UNCERTAIN"
-            reasons.append("Ljudklassning saknas, så Whisper räknas inte som tal.")
+            if not allow_whisper_only:
+                if status == "SUPPORTED":
+                    status = "UNCERTAIN"
+                reasons.append("Ljudklassning saknas, så Whisper räknas inte som tal.")
+            else:
+                reasons.append(
+                    "Lågminnesläge: separat ljudklassning är avstängd. Texten används bara om Whisper-signalerna klarar kontrollerna."
+                )
         else:
             speech = float(profile.get("speech") or 0)
             nonspeech = float(profile.get("nonspeech") or 0)
