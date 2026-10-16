@@ -1,4 +1,5 @@
 services:
+  # Keep the chat UI lightweight and separate from the video renderer.
   - type: web
     name: cupcat-free
     runtime: docker
@@ -8,14 +9,33 @@ services:
     dockerContext: .
     healthCheckPath: /
     envVars:
+      - key: WORKER_URL
+        value: https://cupcat-worker.onrender.com
+
+  # Python, Whisper, and FFmpeg run in their own free instance.
+  - type: web
+    name: cupcat-worker
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile.worker
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
       - key: DATA_DIR
         value: /tmp/cupcat-data
-      - key: WORKER_URL
-        value: http://127.0.0.1:8787
       - key: WHISPER_MODEL
         value: tiny
       - key: CUPCAT_LITE_MODE
         value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: OMP_THREAD_LIMIT
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: MALLOC_ARENA_MAX
+        value: "2"
       - key: OPENAI_BASE_URL
         value: http://127.0.0.1:11434/v1
       - key: OPENAI_API_KEY
