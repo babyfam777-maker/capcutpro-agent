@@ -1178,7 +1178,7 @@ def _model_messages(analysis: dict, plan: dict | None, text: str, first: bool) -
         "captions": [{"text": caption.get("text"), "start": caption.get("start"), "end": caption.get("end")} for caption in (plan or {}).get("captions") or []],
     }
     return [
-        {"role": "system", "content": _OPS_GUIDE + "\\n\\n" + editor_operation_context()},
+        {"role": "system", "content": _OPS_GUIDE + "\n\n" + editor_operation_context()},
         {"role": "user", "content": json.dumps(brief, ensure_ascii=False)},
     ]
 
