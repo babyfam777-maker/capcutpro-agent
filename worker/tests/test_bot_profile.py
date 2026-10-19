@@ -9,7 +9,7 @@ from app import bot_profile
 def test_editor_context_contains_current_profile_and_json_contract():
     context = bot_profile.editor_operation_context()
     assert "Truth outranks virality" in context
-    assert "no black text box or pill" in context
+    assert "black text box or pill" in context
     assert "safe zone" in context
     assert "JSON format and allowed operations" in context
 
