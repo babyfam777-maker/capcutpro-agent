@@ -2,7 +2,7 @@
 
 import json
 
-from app.creative import initial_plan, parse_intent, revise
+from app.creative import _punch_window, initial_plan, parse_intent, revise
 from app.llm_local import health
 from app.story import _punch
 
@@ -207,6 +207,20 @@ def test_generic_motion_peak_uses_a_visible_punch_zoom():
     assert punch["zoomStart"] == 1.24
     assert punch["zoomEnd"] == 1.36
     assert "124–136%" in punch["reason"]
+
+
+def test_punch_zoom_uses_a_measured_peak_inside_the_kept_timeline():
+    doc = _analysis()
+    doc["motion"] = [
+        {"t": 1.0, "energy": 5.0},
+        {"t": 5.0, "energy": 20.0},
+    ]
+    # The stronger global moment/reaction in the source has already been cut out.
+    kept_plan = {"clips": [{"sourceStart": 0.0, "sourceEnd": 2.0}]}
+    punch = _punch_window(kept_plan, doc)
+    assert punch is not None
+    assert punch["t"] == 1.0
+    assert 0.0 <= punch["t0"] < punch["t1"] <= 2.0
 
 
 def test_remote_model_is_not_contacted_unless_explicitly_allowed(monkeypatch):
