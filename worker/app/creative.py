@@ -170,6 +170,7 @@ def parse_intent(text: str) -> dict[str, Any]:
         "redo": bool(re.search(r"(start over|from scratch|gor om hela|borja om|fran borjan|helt ny)", folded)),
         "trim_open": _opening_seconds(folded),
         "zoom_main": _wants_zoom(folded),
+        "zoom_percent": _requested_zoom(folded),
         "remove_last_caption": bool(re.search(
             r"(remove|ta bort|radera|tabort).{0,40}(last caption|sista text|sista undertext|sista caption|den dar texten|that text|den texten)",
             folded,
@@ -184,6 +185,7 @@ def parse_intent(text: str) -> dict[str, Any]:
             re.search(r"(reaction|reaktion|rolig|funny|skratt|nervos)", folded)
         ) or bool(re.search(r"(his reaction|hennes reaktion|den roliga delen)", folded)),
         "speed_open": _faster_seconds(folded),
+        "speed_factor": _requested_speed(folded) or 1.6,
         "red_text": bool(re.search(r"(texten rod|text red|gor texten rod|make the text red|texten röd)", folded)),
         "grow_opening": bool(re.search(r"(storre|bigger|larger)", folded)) and bool(
             re.search(r"(hook|rubrik|headline|oppning|text)", folded)
@@ -245,7 +247,7 @@ def _opening_seconds(folded: str) -> float | None:
 
 
 def _faster_seconds(folded: str) -> float | None:
-    if not re.search(r"(faster|snabbare|speed up|hoj tempot)", folded):
+    if not re.search(r"(faster|snabbare|snabba upp|speed up|hoj tempot|oka hastigheten|oka tempot)", folded):
         return None
     match = re.search(
         r"(first|forsta|opening).{0,12}(\d+(?:[.,]\d+)?|two|tva|three|tre).{0,12}(second|sekund)",
@@ -255,6 +257,31 @@ def _faster_seconds(folded: str) -> float | None:
         return 2.0 if re.search(r"(first two|forsta tva|opening)", folded) else None
     token = match.group(2).replace(",", ".")
     return float(_NUMBERS.get(token, token))
+
+
+def _requested_zoom(folded: str) -> float | None:
+    """Read an explicit zoom percentage such as 130% without confusing speed ratios."""
+    match = re.search(r"(?<!\d)(\d{2,3}(?:[.,]\d+)?)\s*%", folded)
+    if not match:
+        return None
+    try:
+        return min(2.2, max(1.0, float(match.group(1).replace(",", ".")) / 100.0))
+    except ValueError:
+        return None
+
+
+def _requested_speed(folded: str) -> float | None:
+    """Read a requested playback speed near a speed-up instruction."""
+    match = re.search(
+        r"(?:faster|snabbare|snabba upp|speed up|hoj tempot|oka hastigheten|oka tempot).{0,55}?(?:to|till|at|i)?\s*(\d+(?:[.,]\d+)?)\s*x",
+        folded,
+    )
+    if not match:
+        return None
+    try:
+        return min(2.0, max(1.05, float(match.group(1).replace(",", "."))))
+    except ValueError:
+        return None
 
 
 def _wants_zoom(folded: str) -> bool:
@@ -411,7 +438,7 @@ def _apply_rules(analysis, plan, text, first, intent) -> dict:
         ("arrow_person", lambda: _add_person_arrow(working, analysis)),
         ("zoom_touch", lambda: _zoom_touch(working, analysis)),
         ("start_reaction", lambda: _start_reaction(working, analysis)),
-        ("speed_open", lambda: _speed_opening(working, float(intent["speed_open"]))),
+        ("speed_open", lambda: _speed_opening(working, float(intent["speed_open"]), float(intent.get("speed_factor") or 1.6))),
         ("remove_last_caption", lambda: _remove_last_caption(working)),
         ("remove_word", lambda: _drop_word(working, str(intent["remove_word"]))),
         ("remove_kind", lambda: _drop_kind(working, str(intent["remove_kind"]))),
@@ -1024,8 +1051,8 @@ def _retime_from_source(plan: dict) -> None:
     plan["captions"] = moved
 
 
-def _speed_opening(plan: dict, seconds: float) -> tuple[bool, str]:
-    speed = 1.6
+def _speed_opening(plan: dict, seconds: float, speed: float = 1.6) -> tuple[bool, str]:
+    speed = min(2.0, max(1.05, float(speed)))
     if not plan.get("clips"):
         return False, "Det finns inget klipp att snabba på."
     rows, _total = timeline(plan)
@@ -1230,7 +1257,8 @@ def _apply_op(plan: dict, analysis: dict, op: dict, intent: dict, first: bool) -
     if name == "trim_opening":
         return _trim_opening(plan, float(op.get("seconds") or intent.get("trim_open") or 0), _duration(analysis))
     if name == "zoom_main":
-        _zoom_main(plan, analysis, float(op.get("zoomEnd") or 1.55))
+        target_zoom = float(op.get("zoomEnd") or intent.get("zoom_percent") or 1.55)
+        _zoom_main(plan, analysis, target_zoom)
         return True, "zoom"
     if name == "remove_last_caption":
         return _remove_last_caption(plan)
@@ -1245,7 +1273,8 @@ def _apply_op(plan: dict, analysis: dict, op: dict, intent: dict, first: bool) -
     if name == "start_reaction":
         return _start_reaction(plan, analysis)
     if name == "speed_opening":
-        return _speed_opening(plan, float(op.get("seconds") or intent.get("speed_open") or 2))
+        target_speed = float(op.get("speed") or intent.get("speed_factor") or 1.6)
+        return _speed_opening(plan, float(op.get("seconds") or intent.get("speed_open") or 2), target_speed)
     if name == "red_accent":
         return _red_accent(plan)
     if name == "grow_opening":
@@ -1339,8 +1368,9 @@ def _rejects(before, after, intent, analysis, text, first) -> str | None:
     if intent.get("zoom_main"):
         before_zoom = max((float(clip.get("zoomEnd") or 1) for clip in (base or {}).get("clips") or []), default=1)
         after_zoom = max(float(clip.get("zoomEnd") or 1) for clip in after["clips"])
-        if after_zoom < max(1.4, before_zoom + 0.08):
-            return "Modellen zoomade inte in."
+        required_zoom = float(intent.get("zoom_percent") or 1.4)
+        if after_zoom < max(required_zoom, before_zoom + 0.08):
+            return f"Modellen zoomade inte till begärd nivå ({required_zoom:.0%})."
     elif intent.get("zoom_reaction"):
         after_zoom = max(float(clip.get("zoomEnd") or 1) for clip in after["clips"])
         if after_zoom < 1.10:
@@ -1351,6 +1381,20 @@ def _rejects(before, after, intent, analysis, text, first) -> str | None:
         after_zoom = max((float(clip.get("zoomEnd") or 1) for clip in after["clips"]), default=1)
         if after_zoom > 1.05:
             return "Modellen zoomade fast instruktionen inte bad om zoom."
+    if intent.get("speed_open") is not None:
+        required_speed = float(intent.get("speed_factor") or 1.6)
+        first_start = float((after.get("clips") or [{}])[0].get("sourceStart") or 0)
+        first_source = [
+            clip for clip in after.get("clips") or []
+            if float(clip.get("speed") or 1) >= required_speed - 0.05
+            and float(clip.get("sourceStart") or 0) <= first_start + 0.08
+        ]
+        sped_source_seconds = sum(
+            max(0.0, float(clip.get("sourceEnd") or 0) - float(clip.get("sourceStart") or 0))
+            for clip in first_source
+        )
+        if sped_source_seconds < min(float(intent["speed_open"]), 0.8):
+            return f"Modellen ökade inte öppningens hastighet till {required_speed:.2f}x."
     if intent.get("remove_last_caption"):
         if _caption_count(after) != _caption_count(base) - 1:
             return "Modellen tog inte bort exakt den sista texten."
