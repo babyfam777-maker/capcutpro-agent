@@ -1,0 +1,27 @@
+name: CupCat bot clone checks
+
+on:
+  push:
+    branches:
+      - cursor/cupcat-bot-clone
+  pull_request:
+    branches:
+      - cursor/cupcat-bot-clone
+
+jobs:
+  profile-and-syntax:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install only profile test dependencies
+        run: python -m pip install pytest PyYAML==6.0.2
+      - name: Compile Python source
+        run: python -m compileall -q app
+      - name: Test bot profile and memory
+        run: python -m pytest -q tests/test_bot_profile.py
