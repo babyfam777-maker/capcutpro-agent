@@ -87,7 +87,7 @@ export function Editor() {
 
     setError("");
     setStep("upload");
-    setLog((current) => [...current, "Servern tappade projektet. Återställer originalvideon automatiskt…"]);
+    setLog((current) => [...current, `${label}: servern tappade projektet. Återställer originalvideon automatiskt…`]);
     const restored = await uploadProjectFile(file);
     setProject(restored);
     setView("original");
