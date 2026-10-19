@@ -25,6 +25,15 @@ def apply_studio(analysis: dict, edited: dict, instruction: str, project, *, fir
         return edited
     plan = edited["plan"]
     story = build_story(analysis)
+    intent = creative.parse_intent(instruction)
+    if intent.get("punch_zoom") and story.get("punch"):
+        requested_zoom = float(intent.get("zoom_percent") or story["punch"].get("zoomEnd") or 1.36)
+        story["punch"]["zoomEnd"] = requested_zoom
+        story["punch"]["zoomStart"] = max(1.08, requested_zoom - 0.12)
+        story["punch"]["reason"] = (
+            f"Begärd lokal punch-zoom {story['punch']['zoomStart']:.0%}–{requested_zoom:.0%} "
+            f"på uppmätt moment vid {float(story['punch'].get('t0') or 0):.2f}s."
+        )
     trends = analyze_trending_data(_topic(instruction), None, _region(instruction))
     changes = list(edited.get("changes") or [])
     learnings = _load(project)
