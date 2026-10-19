@@ -69,7 +69,7 @@ def health(timeout: float = 1.5) -> dict:
     }
 
 
-def complete(messages: list[dict], timeout: float = 90) -> str:
+def complete(messages: list[dict], timeout: float = 900) -> str:
     """One chat completion. Raises if the local server does not answer."""
     body = json.dumps({
         "model": MODEL,
