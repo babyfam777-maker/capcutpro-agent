@@ -14,7 +14,7 @@ import uuid
 from typing import Any, Callable
 
 from . import llm_local
-from .bot_profile import editor_operation_context
+from .bot_profile import editor_operation_context, full_behavior_context
 from .plan_ops import empty_plan, timeline
 
 _FOLD = str.maketrans("åäöéü", "aaoeu")
@@ -1178,7 +1178,7 @@ def _model_messages(analysis: dict, plan: dict | None, text: str, first: bool) -
         "captions": [{"text": caption.get("text"), "start": caption.get("start"), "end": caption.get("end")} for caption in (plan or {}).get("captions") or []],
     }
     return [
-        {"role": "system", "content": _OPS_GUIDE + "\n\n" + editor_operation_context()},
+        {"role": "system", "content": full_behavior_context() + "\n\n" + _OPS_GUIDE + "\n\n" + editor_operation_context()},
         {"role": "user", "content": json.dumps(brief, ensure_ascii=False)},
     ]
 
