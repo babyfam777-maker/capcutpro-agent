@@ -767,13 +767,60 @@ def _zoom_range(
     return True, f"Inzoomning mellan {t0:.2f}s och {t1:.2f}s i källan. {reason}"
 
 
-def _apply_punch_zoom(plan: dict, analysis: dict, requested_zoom: float | None = None) -> tuple[bool, str]:
-    """Zoom only the story's measured punch interval, never the whole clip."""
+def _punch_window(plan: dict, analysis: dict) -> dict | None:
+    """Use the strongest measured punch that is still inside the active edit."""
     from .story import build_story
 
+    clips = plan.get("clips") or []
+    ranges = [
+        (float(clip.get("sourceStart") or 0), float(clip.get("sourceEnd") or 0))
+        for clip in clips
+    ]
+    if not ranges:
+        return None
+
     punch = build_story(analysis).get("punch")
+    if punch and any(start < float(punch["t1"]) and end > float(punch["t0"]) for start, end in ranges):
+        return punch
+
+    # The original video's strongest moment may have been cut out in an earlier
+    # version. Re-select the strongest measured motion remaining in the timeline.
+    eligible = []
+    for row in analysis.get("motion") or []:
+        if "energy" not in row or "t" not in row:
+            continue
+        t = float(row["t"])
+        if any(start <= t <= end for start, end in ranges):
+            eligible.append(row)
+    if not eligible:
+        return None
+
+    peak = max(eligible, key=lambda row: float(row.get("energy") or 0))
+    t = float(peak["t"])
+    start, end = next((left, right) for left, right in ranges if left <= t <= right)
+    t0 = max(start, t - 0.35)
+    t1 = min(end, t + 0.85)
+    if t1 - t0 < 0.45:
+        t0 = max(start, t - 0.22)
+        t1 = min(end, t + 0.23)
+    if t1 - t0 < 0.2:
+        return None
+    return {
+        "t": round(t, 3),
+        "t0": round(t0, 3),
+        "t1": round(t1, 3),
+        "zoomStart": 1.24,
+        "zoomEnd": 1.36,
+        "confirmed": False,
+        "reason": f"Lokalt mätt rörelsepeak vid {t:.2f}s i den del som fortfarande finns i tidslinjen.",
+    }
+
+
+def _apply_punch_zoom(plan: dict, analysis: dict, requested_zoom: float | None = None) -> tuple[bool, str]:
+    """Zoom only the story's measured punch interval, never the whole clip."""
+    punch = _punch_window(plan, analysis)
     if not punch:
-        return False, "Ingen uppmätt rörelsetopp eller bekräftad reaktion hittades; ingen punkt att punch-zooma."
+        return False, "Ingen uppmätt rörelsetopp finns kvar i den aktiva tidslinjen; ingen punch-zoom hittades på."
     zoom_end = float(requested_zoom or punch.get("zoomEnd") or 1.36)
     zoom_end = min(1.75, max(1.10, zoom_end))
     zoom_start = max(1.08, zoom_end - 0.12)
@@ -1406,10 +1453,9 @@ def _rejects(before, after, intent, analysis, text, first) -> str | None:
         if now + 0.15 < origin + float(intent["trim_open"]):
             return "Modellen tog inte bort öppningen."
     if intent.get("punch_zoom"):
-        from .story import build_story
-        punch = build_story(analysis).get("punch")
+        punch = _punch_window(after, analysis)
         if not punch:
-            return "Ingen uppmätt rörelsetopp finns att punch-zooma på."
+            return "Ingen uppmätt rörelsetopp finns kvar att punch-zooma på."
         required_zoom = float(intent.get("zoom_percent") or punch.get("zoomEnd") or 1.36)
         t0, t1 = float(punch["t0"]), float(punch["t1"])
         local = [
