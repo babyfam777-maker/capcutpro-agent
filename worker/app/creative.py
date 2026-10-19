@@ -440,7 +440,8 @@ def _apply_rules(analysis, plan, text, first, intent) -> dict:
         ("trim_open", lambda: _trim_opening(working, float(intent["trim_open"]), _duration(analysis))),
         ("zoom_reaction", lambda: _zoom_reaction(working, analysis)),
         ("punch_zoom", lambda: _apply_punch_zoom(working, analysis, intent.get("zoom_percent"))),
-        ("zoom_main", lambda: (True, _zoom_main(working, analysis, float(intent.get("zoom_percent") or 1.55))),
+        ("zoom_main", lambda: (True, _zoom_main(working, analysis, float(intent.get("zoom_percent") or 1.55)))),
+
         ("blur", lambda: _add_blur(working, analysis)),
         ("freeze", lambda: _freeze(working, analysis)),
         ("speed_ramp", lambda: _speed_ramp(working)),
