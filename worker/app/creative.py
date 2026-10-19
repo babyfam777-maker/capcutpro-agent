@@ -247,14 +247,18 @@ def _opening_seconds(folded: str) -> float | None:
 
 
 def _faster_seconds(folded: str) -> float | None:
-    if not re.search(r"(faster|snabbare|snabba upp|speed up|hoj tempot|oka hastigheten|oka tempot)", folded):
+    cue = re.search(r"(faster|snabbare|snabba upp|speed up|hoj tempot|oka hastigheten|oka tempot)", folded)
+    if not cue:
         return None
+    # Only parse the span AFTER the speed instruction. Earlier trim requests may
+    # contain another "first N seconds" phrase and must not override this value.
+    tail = folded[cue.end():cue.end() + 100]
     match = re.search(
-        r"(first|forsta|opening).{0,12}(\d+(?:[.,]\d+)?|two|tva|three|tre).{0,12}(second|sekund)",
-        folded,
+        r"(first|forsta|opening).{0,24}(\d+(?:[.,]\d+)?|two|tva|three|tre).{0,12}(second|sekund)",
+        tail,
     )
     if not match:
-        return 2.0 if re.search(r"(first two|forsta tva|opening)", folded) else None
+        return 2.0 if re.search(r"(first two|forsta tva|opening)", tail) else None
     token = match.group(2).replace(",", ".")
     return float(_NUMBERS.get(token, token))
 
