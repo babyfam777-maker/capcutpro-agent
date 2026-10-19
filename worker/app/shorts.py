@@ -10,6 +10,7 @@ import copy
 import json
 
 from .config import SHORT_DELIVERY
+from .bot_profile import remember_rule_if_requested
 from .creative import parse_intent, revise, track_view
 from .export_spec import SHORT_EXPORT, describe_export
 from .ffmpeg_util import probe
@@ -30,6 +31,7 @@ def render_first_short(project, prompt: str, on_event) -> dict:
     prompt = " ".join(str(prompt or "").split())
     if not prompt:
         raise RuntimeError("Skriv vad shortsen ska handla om.")
+    remember_rule_if_requested(prompt)
     project.messages.append({"role": "user", "content": prompt})
     project.save_messages()
     on_event("status", {"step": "analyze"})
@@ -65,6 +67,7 @@ def render_again(project, lines: list[str], on_event) -> dict:
     backend = "rules"
     model_note = None
     for line in cleaned:
+        remember_rule_if_requested(line)
         project.messages.append({"role": "user", "content": line})
         feedback = parse_feedback(line)
         if feedback:
