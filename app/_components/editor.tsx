@@ -577,7 +577,7 @@ export function Editor() {
 }
 
 function projectIdFromWorkerUrl(url: string): string | null {
-  return url.match(/\\/projects\\/([^/?#]+)/)?.[1] ?? null;
+  return url.match(/\/projects\/([^/?#]+)/)?.[1] ?? null;
 }
 
 function isMissingProjectMessage(message: string): boolean {
