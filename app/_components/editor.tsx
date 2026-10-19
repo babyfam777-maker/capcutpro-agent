@@ -50,6 +50,7 @@ export function Editor() {
   const [dragging, setDragging] = useState(false);
   const [filename, setFilename] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
+  const sourceFileRef = useRef<File | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
@@ -68,23 +69,49 @@ export function Editor() {
     return next;
   }
 
+  async function uploadProjectFile(file: File): Promise<Project> {
+    const body = new FormData();
+    body.append("file", file);
+    const response = await fetch(workerUrl("projects"), { method: "POST", body });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(messageOf(payload, "Uppladdningen misslyckades."));
+    return payload as Project;
+  }
+
+  async function restoreProjectAfterRestart(url: string, label: string): Promise<string> {
+    const file = sourceFileRef.current;
+    const oldId = projectIdFromWorkerUrl(url);
+    if (!file || !oldId) {
+      throw new Error("Servern tappade projektet. Ladda upp originalvideon igen för att fortsätta.");
+    }
+
+    setError("");
+    setStep("upload");
+    setLog((current) => [...current, "Servern tappade projektet. Återställer originalvideon automatiskt…"]);
+    const restored = await uploadProjectFile(file);
+    setProject(restored);
+    setView("original");
+    setFilename(file.name);
+    setPending([]);
+    setStep("analyze");
+    setLog((current) => [...current, "Originalvideon är återställd. Försöker redigeringen igen."]);
+    return url.replace(`/projects/${oldId}/`, `/projects/${restored.id}/`);
+  }
+
   async function onFile(file: File) {
     if (!isVideo(file)) {
       setError("Släpp en videofil, till exempel MP4 eller MOV.");
       return;
     }
+    sourceFileRef.current = file;
     setError("");
     setBusy(true);
     setStep("upload");
     setLog(["Laddar upp videon"]);
     setProgress(null);
     try {
-      const body = new FormData();
-      body.append("file", file);
-      const response = await fetch(workerUrl("projects"), { method: "POST", body });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(messageOf(payload, "Uppladdningen misslyckades."));
-      setProject(payload as Project);
+      const uploaded = await uploadProjectFile(file);
+      setProject(uploaded);
       setView("original");
       setFilename(file.name);
       setPending([]);
@@ -137,68 +164,129 @@ export function Editor() {
     setProgress(null);
     setLog([label]);
     setStep("analyze");
-    let failed = false;
+    let requestUrl = url;
+    let recovered = false;
+
     try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const type = response.headers.get("content-type") || "";
-      if (!response.ok || !type.includes("text/event-stream") || !response.body) {
-        const payload = await response.json().catch(() => ({}));
-        throw new Error(messageOf(payload, "Render misslyckades."));
-      }
-      await readEvents(response, (event, data) => {
-        if (event === "status" && data.step) {
-          const name = String(data.step);
-          setStep(name);
-          setLog((current) => [...current, STEP_LABELS[name] || name]);
-        }
-        if (event === "analysis") {
-          const duration = typeof data.duration === "number" ? data.duration : 0;
-          setLog((current) => [
-            ...current,
-            `${duration.toFixed(1)}s källa · ${num(data.phrases)} fraser · ${num(data.faces)} ansikten · ${num(data.scenes)} klipp`,
-          ]);
-        }
-        if (event === "progress") setProgress(typeof data.progress === "number" ? data.progress : null);
-        if (event === "edits" && Array.isArray(data.changes)) {
-          const lines = (data.changes as unknown[]).map((item: unknown) => String(item));
-          setLog((current) => [...current, ...lines]);
-        }
-        if (event === "qa" && data.ok === false && Array.isArray(data.checks)) {
-          const names = data.checks.flatMap((item) => {
-            if (!item || typeof item !== "object") return [];
-            const row = item as { ok?: boolean; name?: string };
-            return row.ok === false && row.name ? [row.name] : [];
+      // A Render Free instance can be restarted if it hits its memory limit.
+      // The browser still has the original File object, so recover the project
+      // and replay the same instruction once instead of leaving a dead project id.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const projectId = projectIdFromWorkerUrl(requestUrl);
+        let response: Response;
+        try {
+          response = await fetch(requestUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
           });
-          if (names.length) setLog((current) => [...current, `Kontroll: ${names.join(", ")}`]);
+        } catch (reason) {
+          if (!recovered && sourceFileRef.current) {
+            requestUrl = await restoreProjectAfterRestart(requestUrl, label);
+            recovered = true;
+            continue;
+          }
+          throw reason;
         }
-        if (event === "version" && data.activeVersion) {
-          const version = Number(data.activeVersion);
-          setView(version);
-          setProject((current) => {
-            if (!current) return current;
-            if (current.versions.some((item) => item.version === version)) return { ...current, activeVersion: version };
-            return { ...current, activeVersion: version, versions: [...current.versions, { version }] };
+
+        const type = response.headers.get("content-type") || "";
+        if (!response.ok || !type.includes("text/event-stream") || !response.body) {
+          const payload = await response.json().catch(() => ({}));
+          const message = messageOf(payload, "Render misslyckades.");
+          if (!recovered && isMissingProjectMessage(message) && sourceFileRef.current) {
+            requestUrl = await restoreProjectAfterRestart(requestUrl, label);
+            recovered = true;
+            continue;
+          }
+          throw new Error(message);
+        }
+
+        let streamFailed = false;
+        let streamError = "";
+        try {
+          await readEvents(response, (event, data) => {
+            if (event === "status" && data.step) {
+              const name = String(data.step);
+              setStep(name);
+              setLog((current) => [...current, STEP_LABELS[name] || name]);
+            }
+            if (event === "analysis") {
+              const duration = typeof data.duration === "number" ? data.duration : 0;
+              setLog((current) => [
+                ...current,
+                `${duration.toFixed(1)}s källa · ${num(data.phrases)} fraser · ${num(data.faces)} ansikten · ${num(data.scenes)} klipp`,
+              ]);
+            }
+            if (event === "progress") setProgress(typeof data.progress === "number" ? data.progress : null);
+            if (event === "edits" && Array.isArray(data.changes)) {
+              const lines = (data.changes as unknown[]).map((item: unknown) => String(item));
+              setLog((current) => [...current, ...lines]);
+            }
+            if (event === "qa" && data.ok === false && Array.isArray(data.checks)) {
+              const names = data.checks.flatMap((item) => {
+                if (!item || typeof item !== "object") return [];
+                const row = item as { ok?: boolean; name?: string };
+                return row.ok === false && row.name ? [row.name] : [];
+              });
+              if (names.length) setLog((current) => [...current, `Kontroll: ${names.join(", ")}`]);
+            }
+            if (event === "version" && data.activeVersion) {
+              const version = Number(data.activeVersion);
+              setView(version);
+              setProject((current) => {
+                if (!current) return current;
+                if (current.versions.some((item) => item.version === version)) return { ...current, activeVersion: version };
+                return { ...current, activeVersion: version, versions: [...current.versions, { version }] };
+              });
+            }
+            if (event === "error") {
+              streamFailed = true;
+              streamError = String(data.message || "Något gick fel.");
+            }
+            if (event === "done") {
+              if (data.activeVersion) setView(Number(data.activeVersion));
+              if (data.reply) setLog((current) => [...current, String(data.reply)]);
+            }
           });
+        } catch (reason) {
+          // Interrupted SSE is the normal symptom when the free worker is killed.
+          if (!recovered && sourceFileRef.current) {
+            requestUrl = await restoreProjectAfterRestart(requestUrl, label);
+            recovered = true;
+            continue;
+          }
+          throw reason;
         }
-        if (event === "error") {
-          failed = true;
-          setError(String(data.message || "Något gick fel."));
+
+        if (streamFailed) {
+          if (!recovered && isMissingProjectMessage(streamError) && sourceFileRef.current) {
+            requestUrl = await restoreProjectAfterRestart(requestUrl, label);
+            recovered = true;
+            continue;
+          }
+          setError(streamError);
+          return false;
         }
-        if (event === "done") {
-          if (data.activeVersion) setView(Number(data.activeVersion));
-          if (data.reply) setLog((current) => [...current, String(data.reply)]);
+
+        try {
+          const next = await refresh(projectId || "");
+          if (next.activeVersion) {
+            setView(next.activeVersion);
+            requestAnimationFrame(() => videoRef.current?.scrollIntoView({ block: "center", behavior: "smooth" }));
+          }
+          return true;
+        } catch (reason) {
+          const message = reason instanceof Error ? reason.message : String(reason);
+          if (!recovered && isMissingProjectMessage(message) && sourceFileRef.current) {
+            requestUrl = await restoreProjectAfterRestart(requestUrl, label);
+            recovered = true;
+            continue;
+          }
+          throw reason;
         }
-      });
-      const next = await refresh(project!.id);
-      if (next.activeVersion) {
-        setView(next.activeVersion);
-        requestAnimationFrame(() => videoRef.current?.scrollIntoView({ block: "center", behavior: "smooth" }));
       }
-      return !failed;
+
+      throw new Error("CupCat kunde inte återställa projektet efter serveromstart. Försök med en kortare video.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Något gick fel.");
       return false;
@@ -486,6 +574,14 @@ export function Editor() {
       </div>
     </main>
   );
+}
+
+function projectIdFromWorkerUrl(url: string): string | null {
+  return url.match(/\\/projects\\/([^/?#]+)/)?.[1] ?? null;
+}
+
+function isMissingProjectMessage(message: string): boolean {
+  return /projektet finns inte|project not found/i.test(message);
 }
 
 function num(value: unknown) {
