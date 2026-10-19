@@ -171,7 +171,8 @@ def test_swedish_snabba_upp_and_explicit_zoom_are_parsed():
     assert intent["trim_open"] == 2.5
     assert intent["speed_open"] == 2.0
     assert intent["speed_factor"] == 1.6
-    assert intent["zoom_main"] is True
+    assert intent["punch_zoom"] is True
+    assert intent["zoom_main"] is False
     assert intent["zoom_percent"] == 1.3
 
 
@@ -187,7 +188,7 @@ def test_model_plan_applies_swedish_trim_speed_and_zoom_request():
         return json.dumps({"ops": [
             {"op": "trim_opening", "seconds": 2.5},
             {"op": "speed_opening", "seconds": 2, "speed": 1.6},
-            {"op": "zoom_main", "zoomEnd": 1.3},
+            {"op": "punch_zoom", "zoomEnd": 1.3},
             {"op": "set_audio", "keepOriginal": True, "music": False},
         ]})
 
@@ -196,6 +197,8 @@ def test_model_plan_applies_swedish_trim_speed_and_zoom_request():
     assert result["plan"]["clips"][0]["sourceStart"] == 2.5
     assert result["plan"]["clips"][0]["speed"] == 1.6
     assert max(float(clip["zoomEnd"]) for clip in result["plan"]["clips"]) == 1.3
+    assert any(clip.get("label") == "punch" for clip in result["plan"]["clips"])
+    assert any(float(clip.get("zoomEnd") or 1) <= 1.05 for clip in result["plan"]["clips"] if clip.get("label") != "punch")
 
 
 def test_generic_motion_peak_uses_a_visible_punch_zoom():
