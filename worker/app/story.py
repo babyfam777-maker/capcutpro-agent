@@ -176,12 +176,12 @@ def _punch(peak, reaction, surprise, duration: float) -> dict | None:
     return {
         "t0": round(t0, 3),
         "t1": round(t1, 3),
-        "zoomStart": 1.10,
-        "zoomEnd": 1.18,
+        "zoomStart": 1.24,
+        "zoomEnd": 1.36,
         "confirmed": False,
         "reason": (
-            f"Punch-zoom 110–118% på rörelsetoppen vid {float(peak['t']):.2f}s. "
-            "Det är inte en bekräftad reaktion eller ett ansikte."
+            f"Punch-zoom 124–136% på den uppmätta rörelsetoppen vid {float(peak['t']):.2f}s. "
+            "Det är en synlig redigeringsmarkering av rörelse, inte en bekräftad reaktion eller känsla."
         ),
     }
 
