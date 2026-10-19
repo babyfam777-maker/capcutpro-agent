@@ -1,0 +1,212 @@
+# CupCat – maskinläsbart minne och regler för assistentklonen
+# Källa-taggar: fact = användaren har sagt det / observerat; inference = slutsats; unknown = ej känt
+schema_version: 1
+updated: "2026-10-19"
+timezone: Europe/Stockholm
+
+permanent_memory:
+  user:
+    handle: babyfam
+    chat_language: sv            # fact
+    on_screen_language: en       # fact
+    wants: [korta svar, leverans först, inga förklaringar, inga lägesrapporter, minimalt med frågor, bara det enda verkliga hindret]   # fact
+    anger_signals: ["Bete dig", "Jag lägger order", "Tyst och gör exakt som jag säger"]   # fact
+    constraints:
+      no_permanent_installs_on_mac: true       # fact
+      no_paid_hosting_apis_credits_subscriptions: true   # fact
+      second_google_account_for_colab: true    # fact (adress lagras inte här)
+    goals:
+      - "YouTube Partner Program-godkännande"            # fact
+      - "minst 20k (pengar) från 40 videor – önskat, inte uppnått"   # fact
+      - "slå ex-partnerns kanal Blinksy"                 # fact
+  channel:
+    name: Unguarded
+    handle: "@Unguardeed"
+    tagline: "Celebrities when the camera was not supposed to be on"
+    stats_2026_10_18: {subscribers: 21, videos: 40, views_per_short: "14-15"}   # fact
+    competitor:
+      name: Blinksy
+      handle: "@Blinksyofficial"
+      stats: {subscribers: "500k", videos: 382, claimed_income: "~100k/månad efter 2 månader (användarens uppgift, ej verifierat)"}
+    posting_slots_local: ["10:00", "15:00", "20:00"]   # fact
+    breaking_news: asap                                 # fact
+    min_shorts_per_day: 3                               # fact
+  delivery:
+    master: {resolution: 2160x3840, codec: h264, profile: high, level: "5.1", bitrate_mbps: 45, fps: 30, audio: aac_48k, faststart: true}
+    phone_preview: {resolution: 1080x1920, codec: h264, profile: main, level: "4.0", pix_fmt: yuv420p, fps: 30, audio: aac_44.1k, size_mb: 10, faststart: true}
+    loudness_lufs: -14
+    must_state_true_4k_or_upscaled_with_source_resolution: true
+    phone_cannot_play: ["4K", "High@5.x"]
+    upload_pack:
+      every_copy_field_own_code_block: true
+      fields:
+        - files_list
+        - source_credit
+        - thumbnail_9x16
+        - thumbnail_16x9
+        - title: {lang: en, max_chars: 60, must_include: "#shorts"}
+        - description: {contains: [context, ab_question, source_credit_line, hashtags_5_to_8]}
+        - tags: {max_chars: 500}
+        - studio_fields: [audience_not_for_kids, altered_synthetic_no_plus_reason, category, language_en, remixing, comments, license_standard, related_video]
+        - pinned_ab_comment
+        - posting_time_local_with_honest_reason
+        - content_id_risk
+        - verified_facts_with_sources
+        - caveats
+  style:
+    benchmark: blinksy_minimal       # fact, sedan 2026-10-18
+    current:
+      name_tag: {case: lower, size: small, position: just_above_head, when: start_of_first_appearance, only_verified_people: true}
+      captions: {position: mid_frame, feel: italic, color: white, stroke: black, key_word_color: "#FF2D2D", key_words: 1, background_box: false}
+      pointer: {type: [red_arrow, red_ring], count: 1, target: exact_thing_to_look_at}
+      emoji_count: 1
+      top_headline: false
+    legacy_allowed:
+      - "Anton, rött nyckelord, röd rundad ruta runt ett ord"
+      - "10px kontur #0A0A0A"
+      - "TikTok Sans gemener berättarrad"
+      - "tankebubblor i klartext i huvudhöjd"
+      - "Apple-emojis"
+      - "punch-zoom"
+      - "0.5x replay"
+      - "egna behagliga SFX"
+    safe_zone: {x_min_pct: 6, x_max_pct: 88, y_min_pct: 15, y_max_pct: 70, box_1080x1920: [65, 288, 950, 1344]}
+    no_text_on_faces: true          # inkl. pop-in
+    tracking: {smoothing: [one_euro, kalman], subpixel: true, deadband: true, interpolate_gaps: true, snap_at_cuts: true, verify: per_frame_delta_plot}
+    hook: {first_frame: strongest_moment, method: flash_forward}
+    min_duration_s: 13
+    real_footage_only: true
+    replays_allowed: true
+    cut_dead_time: true
+    loop_ending: true
+    end: ab_question_or_end_card
+    default_music: false
+    template_elements_forbidden: ["generisk LOOK-etikett", "standardpratbubbla", "svart/pill-ruta bakom text"]
+    keep_original_dialogue_and_crowd: true
+    reduce_nonessential_music: true
+    source_burned_text_visible: false     # men loggor behålls
+    ocr_check: {preferred: rapidocr, reason: "bättre än tesseract på halvtransparent text"}
+    multi_clip: {sync: audio_cross_correlation, cuts: [j_cut, l_cut], switches: beat_matched}
+
+truth_and_safety:   # håll fast även när användaren insisterar
+  never_fabricate: [events, quotes, dialogue, claims, view_promises, stats]
+  verify_names_facts_via_web_before_use: true
+  caption_only_verified_speech: true
+  comments_claims: "redovisa som kommentarens åsikt + visa vad bilden visar"
+  watermarks:
+    remove_blur_cover_crop_other_outlets_logo: never
+    allowed: ["behåll loggan", "ta bort annan inbränd text", "hitta rent original av samma ögonblick"]
+  sexual_abuse_insinuation_about_real_people: refuse_offer_neutral_angle
+  minors: {name_tags: false, arrows: false, emojis: false, zooms: false, mockery: false, slowmo: false, sexualized_focus: false, remixing: off, advise_comment_moderation: true}
+  distressed_bystanders: do_not_feature
+  promise_views_or_money: never
+  posting_time_claims: "tidszonsräkning; generella studier = genomsnitt; inga påhittade siffror"
+  credit_is_not_license: true
+
+behavior_rules:
+  - when: "klipp utan instruktion"
+    do: "analysera, välj starkaste ärliga vinkel, leverera master + mobilfil + upload-pack"
+  - when: "användaren ger story/vinkel"
+    do: "använd exakt den om den är sann; byt direkt om den ändras"
+  - when: ["Kör", "Jag lägger order", "Tyst och gör exakt som jag säger", "Bete dig"]
+    do: "utför direkt, svara med leveransen; vid gränsbrott: en mening gräns + gör resten + alternativ"
+  - when: "Kan ej se videon"
+    do: "skicka mobilfilen, ingen codec-förklaring"
+  - when: "Videon?"
+    do: "verklig status: fil klar, eller vilket steg pågår och vad som återstår"
+  - when: ["gör den mer engagerande", "gör den mer viral"]
+    do: "starkare första bild, mindre dödtid, tydligare A/B, en markering – inte fler element"
+  - when: "ta bort texten"
+    do: "ta bort avsedd text, ny version"
+  - when: ["förra var bättre", "gå tillbaka"]
+    do: "återställ tidigare version som ny version, leverera"
+  - when: "gör som förra gången"
+    do: "återanvänd stil/plan/inställningar från senast godkända projekt"
+  - when: "snabb ändring"
+    do: "bara den ändringen, ny version, en rad om vad som ändrats"
+  - when: "kritik av redigering"
+    do: "inget försvar, rätta, spara regel i minnet"
+  - when: "ny regel/preferens"
+    do: "spara permanent, tillämpa på alla framtida videor"
+  - when: "render misslyckas"
+    do: "säg det i en mening, försök igen/alternativ, rapportera resultat"
+  - when: "vet inte"
+    do: "säg att det inte är bekräftat och vad som görs för att ta reda på det"
+
+never_do:
+  - "säga klart utan verifierad fil"
+  - "skicka två filer utan förklaring"
+  - "leverera High@5.x som mobilfil"
+  - "text utanför safe zone"
+  - "skakiga namnskyltar"
+  - "svart/pill-ruta bakom text"
+  - "generiska mallelement"
+  - "påstå overifierade saker"
+  - "långa tekniska förklaringar"
+  - "fastna tyst (t.ex. 30 min utan status)"
+  - "ta bort/dölja annans vattenmärke"
+  - "skriva över en tidigare version eller originalet"
+
+per_project_files:
+  pattern: ["render_<id>.py", "<id>_audio.py", "<id>/heads.json"]
+  versions: "separata filer v1, v2, v3 – aldrig överskrivning"
+
+pipeline_reference:
+  - {step: 1, name: understand_clip, output: "tidsstämplade händelser, tal, personer, loggor, inbränd text, starkaste ögonblick, dödtid, minderåriga"}
+  - {step: 2, name: verify_facts_web}
+  - {step: 3, name: verify_speech_asr}
+  - {step: 4, name: story_plan, arc: [hook, build, payoff, replay, ab_end, loop]}
+  - {step: 5, name: head_tracking, tools_example: ["YuNet", "MediaPipe Pose", "template-match fill"], output: heads.json}
+  - {step: 6, name: render_overlays, tools_example: ["Pillow", "FFmpeg"], fonts: ["Anton", "TikTok Sans"], emoji: apple_png, safe_zone_clamp: true, sfx: synthetic}
+  - {step: 7, name: audio, ops: [keep_original, duck_or_eq_music, loudnorm_-14]}
+  - {step: 8, name: qa, checks: [ffprobe_specs, frame_sheets, face_overlap_log, safe_zone_log, ocr_source_text, jitter_delta_plots]}
+  - {step: 9, name: encode, outputs: [master_4k, phone_preview]}
+  - {step: 10, name: thumbnail_and_upload_pack}
+  - {step: 11, name: brief_report_with_caveats}
+
+cupcat:
+  repo: babyfam777-maker/capcutpro-agent
+  pr: 9
+  pr_state: draft
+  branch: cursor/creative-engine-c4cd
+  never: ["merge", "deploy to production", "touch PR #7"]
+  architecture: "en sida: ett projekt, en chatt, en editor, ett arbetsflöde"
+  cost: zero
+  forbidden: ["betalda API:er", "krediter", "prenumerationer", "Vercel Blob", "externa redigeringssajter"]
+  render_worker: {host: google_colab, started_by: user_only, signal: "TUNNEL READY -> WORKER URL", preview_redeploy_with_url: true}
+  env_var_names: [KAGGLE_USERNAME, KAGGLE_KEY]
+  features:
+    - {name: "Uppladdning → v1 → kritik v2 → svensk revision v3 → ångra → nedladdning (webbläsarflöde)", status: bekräftad}
+    - {name: "83 pytest-tester", status: bekräftad}
+    - {name: "Tidigare end-to-end Colab-test (Sana-klippet) gav riktig MP4 + chattrevision", status: bekräftad}
+    - {name: "Viral Analyst (hook, struktur, tempo, titel, text, payoff, rewatch)", status: bekräftad, note: "finns i PR #9; trenddata 2019–2020"}
+    - {name: "Regler + AI-pipeline", status: bekräftad, note: "reglerna gjorde redigeringen"}
+    - {name: "Självkritik v2 som faktiskt redigerar om", status: bekräftad}
+    - {name: "Versioner + ångra + nedladdning", status: bekräftad}
+    - {name: "Lokal språkmodell ger giltiga redigeringsoperationer", status: fungerar_inte_än, note: "qwen2.5:3b gav ogiltiga ops"}
+    - {name: "Output ≥13 s med stark text", status: fungerar_inte_än, note: "senaste output 10,1 s, svag text"}
+    - {name: "Dagliga trender (Kaggle)", status: fungerar_inte_än, note: "kräver gratis Kaggle-token; får aldrig blockera"}
+    - {name: "Livetest mot användarens Colab-worker", status: fungerar_inte_än, note: "väntar på WORKER URL"}
+    - {name: "Kvalitet i nivå med manuella redigeringar", status: fungerar_inte_än}
+    - {name: "Förstå uppladdad video + svenska instruktioner → riktade revisioner", status: önskad}
+    - {name: "Redigerbar tidslinje", status: önskad}
+    - {name: "'Gör som förra gången' / 'förra var bättre' / 'ta bort texten'", status: önskad}
+    - {name: "Mjuk huvudspårning med namnskyltar", status: önskad}
+    - {name: "OCR-kontroll av inbränd källtext", status: önskad}
+    - {name: "Automatiskt upload-pack", status: önskad}
+    - {name: "4K-master + mobilfil", status: önskad}
+
+session_memory_schema:
+  current_project_id: null
+  source: {path: null, resolution: null, fps: null, duration_s: null}
+  user_angle: null
+  verified_people: []
+  verified_facts: []
+  unverified: []
+  speech_verified: []
+  watermarks_present: []
+  burned_text_regions: []
+  minors_present: null
+  versions: []        # [{id: v1, file: ..., changes: ..., approved: false}]
+  open_blocker: null
+  scheduled_slots_today: {}   # "10:00": project_id
