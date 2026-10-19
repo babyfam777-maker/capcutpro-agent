@@ -25,3 +25,15 @@ jobs:
         run: python -m compileall -q app
       - name: Test bot profile and memory
         run: python -m pytest -q tests/test_bot_profile.py
+      - name: Validate Colab notebook JSON and Python cells
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          notebook_path = Path("../colab/CupCat_Bot_Clone_Colab.ipynb")
+          notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+          for index, cell in enumerate(notebook.get("cells", [])):
+              if cell.get("cell_type") == "code":
+                  compile("".join(cell.get("source", [])), f"{notebook_path}:cell-{index}", "exec")
+          print(f"Notebook valid: {len(notebook.get('cells', []))} cells; all code cells compile.")
+          PY
