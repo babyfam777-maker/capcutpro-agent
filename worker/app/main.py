@@ -101,35 +101,6 @@ def post_message(project_id: str, body: dict):
     return _sse(project, lambda on_event: render_first_short(project, text, on_event))
 
 
-def _sse(project: Project, work_fn):
-    if project.busy:
-        raise HTTPException(409, "En redigering pågår redan för den här videon.")
-    project.busy = True
-    events: queue.Queue = queue.Queue()
-
-    def work():
-        try:
-            work_fn(lambda event, data: events.put((event, data)))
-        except Exception as error:
-            events.put(("error", {"message": str(error)}))
-        finally:
-            project.busy = False
-            project.save()
-            events.put(None)
-
-    threading.Thread(target=work, daemon=True).start()
-
-    def stream():
-        while True:
-            item = events.get()
-            if item is None:
-                break
-            event, data = item
-            yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-
 @app.post("/projects/{project_id}/undo")
 def undo(project_id: str):
     project = _project(project_id)
@@ -183,14 +154,24 @@ def _sse(project: Project, work):
             events.put(("error", {"message": str(error)}))
         finally:
             project.busy = False
-            project.save()
-            events.put(None)
+            try:
+                project.save()
+            except Exception as error:
+                # Even a state-save failure must not leave the SSE consumer blocked forever.
+                events.put(("error", {"message": f"Jobbet avslutades men projektstatus kunde inte sparas: {error}"}))
+            finally:
+                events.put(None)
 
     threading.Thread(target=runner, daemon=True).start()
 
     def stream():
         while True:
-            item = events.get()
+            try:
+                item = events.get(timeout=15)
+            except queue.Empty:
+                # Keep reverse proxies from timing out during slow local-model inference.
+                yield ": keep-alive\n\n"
+                continue
             if item is None:
                 break
             event, data = item
