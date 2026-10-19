@@ -24,9 +24,10 @@ def empty_plan() -> dict[str, Any]:
             "accentColor": "#FF2D2D",
             "fillColor": "#FFFFFF",
             "strokeColor": "#0A0A0A",
-            "safeTop": 220,
-            "safeBottom": 320,
-            "safeSide": 60,
+            "safeTop": 288,
+            "safeBottom": 576,
+            "safeSide": 65,
+            "safeRight": 130,
         },
         "audio": {"keepOriginal": True, "music": False, "targetLufs": -14},
     }
