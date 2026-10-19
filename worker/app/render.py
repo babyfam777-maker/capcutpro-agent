@@ -22,10 +22,11 @@ from .ffmpeg_util import probe, run
 from .plan_ops import timeline
 from .sfx import ensure_sfx
 
-SAFE_TOP = 220
-# 30% of 1920. Overlay bottoms stay at or above 70% from the top.
+SAFE_TOP = 288
+# UI-safe area: y 15–70%, x approximately 6–88% at 1080x1920.
 SAFE_BOTTOM = 576
-SAFE_SIDE = 60
+SAFE_LEFT = 65
+SAFE_RIGHT = 130
 
 
 @dataclass
@@ -45,8 +46,17 @@ class Canvas:
         return int(round(SAFE_BOTTOM * self.factor))
 
     @property
+    def safe_left(self) -> int:
+        return int(round(SAFE_LEFT * self.factor))
+
+    @property
+    def safe_right(self) -> int:
+        return int(round(SAFE_RIGHT * self.factor))
+
+    @property
     def safe_side(self) -> int:
-        return int(round(SAFE_SIDE * self.factor))
+        # Backwards-compatible alias for the left inset.
+        return self.safe_left
 
 
 _CANVAS: contextvars.ContextVar[Canvas | None] = contextvars.ContextVar("capcut_canvas", default=None)
@@ -423,13 +433,24 @@ def _composite(image: np.ndarray, plan: dict, out_t: float, faces: list[dict], c
         elif effect["type"] == "circle":
             sprite = gfx.scale_sprite(sprite, 1.015 + 0.065 * np.sin(2 * np.pi * 2 * out_t))
         x, y = _anchor(effect, sprite, faces)
+        if effect["type"] in ("text", "badge") and _overlap_total(x, y, sprite, faces) > 0:
+            # The preferred slot and fallback slots collided with a face. Do not
+            # render text over a face just to force the element into the frame.
+            continue
         gfx.blit(image, sprite, x, y)
     for caption in plan["captions"]:
         if float(caption["start"]) <= out_t < float(caption["end"]):
             sprite = _caption_sprite(caption, cache)
             local = out_t - float(caption["start"])
             sprite = gfx.scale_sprite(sprite, gfx.pop_scale(local) if local < 0.18 else 1)
+            canvas = _canvas()
+            max_width = max(1, canvas.w - canvas.safe_left - canvas.safe_right)
+            if sprite.width > max_width:
+                sprite = gfx.scale_sprite(sprite, max_width / sprite.width)
             x, y = _avoid(sprite, faces, prefer_y=int(_canvas().h * 0.52))
+            if _overlap_total(x, y, sprite, faces) > 0:
+                # No safe slot remained; skip this frame instead of covering a face.
+                continue
             gfx.blit(image, sprite, x, y)
 
 
@@ -530,7 +551,7 @@ def _blur_keep_subjects(image: np.ndarray, faces: list[dict]) -> np.ndarray:
 def _clear_of_faces(x: int, y: int, sprite: Image.Image, faces: list[dict]) -> tuple[int, int]:
     canvas = _canvas()
     limit = int(canvas.h * 0.70) - sprite.height
-    x = int(min(max(x, canvas.safe_side), max(canvas.safe_side, canvas.w - canvas.safe_side - sprite.width)))
+    x = int(min(max(x, canvas.safe_left), max(canvas.safe_left, canvas.w - canvas.safe_right - sprite.width)))
     y = int(min(max(y, canvas.safe_top), max(canvas.safe_top, limit)))
 
     def hit(px: int, py: int) -> float:
@@ -561,11 +582,18 @@ def _overlap(ax, ay, aw, ah, bx, by, bw, bh) -> float:
     return max(0, x2 - x1) * max(0, y2 - y1)
 
 
+def _overlap_total(x: int, y: int, sprite: Image.Image, faces: list[dict]) -> float:
+    return sum(
+        _overlap(x, y, sprite.width, sprite.height, face["x"], face["y"], face["w"], face["h"])
+        for face in faces
+    )
+
+
 def _avoid(sprite: Image.Image, faces: list[dict], prefer_y: int) -> tuple[int, int]:
     canvas = _canvas()
     factor = canvas.factor
     x = int((canvas.w - sprite.width) / 2)
-    x = int(min(max(x, canvas.safe_side), max(canvas.safe_side, canvas.w - canvas.safe_side - sprite.width)))
+    x = int(min(max(x, canvas.safe_left), max(canvas.safe_left, canvas.w - canvas.safe_right - sprite.width)))
     limit = int(canvas.h * 0.70) - sprite.height
     candidates = [prefer_y] + [int(round(y * factor)) for y in (280, 460, 640, 860, 1040)]
     candidates = [y for y in candidates if y <= limit]
