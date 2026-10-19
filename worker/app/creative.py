@@ -417,7 +417,7 @@ def revise(analysis: dict, plan: dict | None, text: str, *, first: bool, llm: Ca
 
 def _other_than_funnier(intent: dict) -> bool:
     return any(intent[key] for key in (
-        "trim_open", "zoom_main", "remove_last_caption", "remove_word", "remove_kind",
+        "trim_open", "zoom_main", "punch_zoom", "remove_last_caption", "remove_word", "remove_kind",
         "add_hand_arrow", "zoom_touch", "start_reaction", "speed_open", "red_text", "grow_opening", "redo",
         "zoom_reaction", "blur", "freeze", "speed_ramp", "slower", "captions_bigger", "satisfying_end",
         "more_viral", "arrow_person",
@@ -1504,7 +1504,10 @@ def _describe(intent: dict, plan: dict, analysis: dict, first: bool) -> list[str
         changes.append(_base_sentence(analysis, plan))
     if intent.get("trim_open"):
         changes.append(f"De första {float(intent['trim_open']):.1f} sekunderna är borttagna.")
-    if intent.get("zoom_main") or intent.get("zoom_reaction"):
+    if intent.get("punch_zoom"):
+        zoom = max(float(clip.get("zoomEnd") or 1) for clip in plan["clips"])
+        changes.append(f"Lokal punch-zoom till {zoom:.0%} på det uppmätta momentet.")
+    elif intent.get("zoom_main") or intent.get("zoom_reaction"):
         face = main_face_id(analysis)
         zoom = max(float(clip.get("zoomEnd") or 1) for clip in plan["clips"])
         changes.append(f"Inzoomning till {zoom:.2f}" + (f" på {face}." if face else " mot mitten. Inget ansikte är spårat."))
