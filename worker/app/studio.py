@@ -25,6 +25,12 @@ def apply_studio(analysis: dict, edited: dict, instruction: str, project, *, fir
         return edited
     plan = edited["plan"]
     story = build_story(analysis)
+    # Keep the chosen punch point inside the active clip selection. A prior cut may
+    # already have removed the global source-video peak.
+    if first and plan.get("clips"):
+        active_punch = creative._punch_window(plan, analysis)
+        if active_punch:
+            story["punch"] = active_punch
     intent = creative.parse_intent(instruction)
     if intent.get("punch_zoom") and story.get("punch"):
         requested_zoom = float(intent.get("zoom_percent") or story["punch"].get("zoomEnd") or 1.36)
