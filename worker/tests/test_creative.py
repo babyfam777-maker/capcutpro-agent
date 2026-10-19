@@ -2,8 +2,9 @@
 
 import json
 
-from app.creative import initial_plan, revise
+from app.creative import initial_plan, parse_intent, revise
 from app.llm_local import health
+from app.story import _punch
 
 
 def _analysis():
@@ -158,6 +159,51 @@ def test_ollama_plan_is_used_only_when_it_follows_the_instruction():
     assert fallback["plan"]["clips"][0]["sourceStart"] == 2
     assert "LOOK" not in _texts(fallback["plan"])
     assert "inte full språkförståelse" in " ".join(fallback["changes"])
+
+
+def test_swedish_snabba_upp_and_explicit_zoom_are_parsed():
+    text = (
+        "Klipp bort de första 2,5 sekunderna. "
+        "Snabba upp öppningens första 2 sekunder till 1,6x. "
+        "Gör en punch-zoom till 130% runt rörelsetoppen."
+    )
+    intent = parse_intent(text)
+    assert intent["trim_open"] == 2.5
+    assert intent["speed_open"] == 2.0
+    assert intent["speed_factor"] == 1.6
+    assert intent["zoom_main"] is True
+    assert intent["zoom_percent"] == 1.3
+
+
+def test_model_plan_applies_swedish_trim_speed_and_zoom_request():
+    base = initial_plan(_analysis())
+    text = (
+        "Klipp bort de första 2,5 sekunderna. "
+        "Snabba upp öppningens första 2 sekunder till 1,6x. "
+        "Gör en punch-zoom till 130% runt rörelsetoppen."
+    )
+
+    def good(_messages):
+        return json.dumps({"ops": [
+            {"op": "trim_opening", "seconds": 2.5},
+            {"op": "speed_opening", "seconds": 2, "speed": 1.6},
+            {"op": "zoom_main", "zoomEnd": 1.3},
+            {"op": "set_audio", "keepOriginal": True, "music": False},
+        ]})
+
+    result = revise(_analysis(), base, text, first=False, llm=good)
+    assert result["backend"] == "ollama"
+    assert result["plan"]["clips"][0]["sourceStart"] == 2.5
+    assert result["plan"]["clips"][0]["speed"] == 1.6
+    assert max(float(clip["zoomEnd"]) for clip in result["plan"]["clips"]) == 1.3
+
+
+def test_generic_motion_peak_uses_a_visible_punch_zoom():
+    punch = _punch({"t": 5.0}, None, None, 20.0)
+    assert punch is not None
+    assert punch["zoomStart"] == 1.24
+    assert punch["zoomEnd"] == 1.36
+    assert "124–136%" in punch["reason"]
 
 
 def test_remote_model_is_not_contacted_unless_explicitly_allowed(monkeypatch):
