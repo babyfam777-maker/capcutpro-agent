@@ -31,6 +31,7 @@ Allowed ops:
 {"op":"set_clip","sourceStart":0,"sourceEnd":1,"speed":1,"zoomStart":1,"zoomEnd":1,"focusTrack":"","reason":""}
 {"op":"trim_opening","seconds":2}
 {"op":"zoom_main","zoomEnd":1.55}
+{"op":"punch_zoom","zoomEnd":1.3}
 {"op":"remove_last_caption"}
 {"op":"remove_word","word":"LOOK"}
 {"op":"remove_kind","kind":"bubble"}
@@ -206,6 +207,13 @@ def parse_intent(text: str) -> dict[str, Any]:
         "more_viral": bool(re.search(r"(mer viral|more viral|gor den viral|make it viral)", folded)),
         "arrow_person": _arrow_person(folded),
     }
+    intent["punch_zoom"] = bool(re.search(
+        r"(punch[\s-]*zoom|zoom.{0,40}(peak|topp|rorelsetopp|motion peak))",
+        folded,
+    ))
+    if intent["punch_zoom"]:
+        # A punch zoom is local to a measured moment, not a zoom across the whole clip.
+        intent["zoom_main"] = False
     boring = _boring_open(folded)
     if boring and intent["trim_open"] is None:
         intent["trim_open"] = boring
@@ -219,7 +227,7 @@ def parse_intent(text: str) -> dict[str, Any]:
         intent["grow_opening"] = False
     intent["any_edit"] = any(
         intent[key] for key in (
-            "redo", "trim_open", "zoom_main", "remove_last_caption", "remove_word", "remove_kind",
+            "redo", "trim_open", "zoom_main", "punch_zoom", "remove_last_caption", "remove_word", "remove_kind",
             "add_hand_arrow", "zoom_touch", "start_reaction", "speed_open", "red_text", "grow_opening",
             "mute", "want_music", "keep_audio", "no_music", "funnier", "zoom_reaction", "blur", "freeze",
             "speed_ramp", "slower", "captions_bigger", "satisfying_end", "more_viral", "arrow_person",
@@ -431,7 +439,8 @@ def _apply_rules(analysis, plan, text, first, intent) -> dict:
     steps = [
         ("trim_open", lambda: _trim_opening(working, float(intent["trim_open"]), _duration(analysis))),
         ("zoom_reaction", lambda: _zoom_reaction(working, analysis)),
-        ("zoom_main", lambda: (True, _zoom_main(working, analysis))),
+        ("punch_zoom", lambda: _apply_punch_zoom(working, analysis, intent.get("zoom_percent"))),
+        ("zoom_main", lambda: (True, _zoom_main(working, analysis, float(intent.get("zoom_percent") or 1.55))),
         ("blur", lambda: _add_blur(working, analysis)),
         ("freeze", lambda: _freeze(working, analysis)),
         ("speed_ramp", lambda: _speed_ramp(working)),
@@ -755,6 +764,29 @@ def _zoom_range(
         return False, "Intervallet ligger utanför tidslinjen."
     plan["clips"] = pieces
     return True, f"Inzoomning mellan {t0:.2f}s och {t1:.2f}s i källan. {reason}"
+
+
+def _apply_punch_zoom(plan: dict, analysis: dict, requested_zoom: float | None = None) -> tuple[bool, str]:
+    """Zoom only the story's measured punch interval, never the whole clip."""
+    from .story import build_story
+
+    punch = build_story(analysis).get("punch")
+    if not punch:
+        return False, "Ingen uppmätt rörelsetopp eller bekräftad reaktion hittades; ingen punkt att punch-zooma."
+    zoom_end = float(requested_zoom or punch.get("zoomEnd") or 1.36)
+    zoom_end = min(1.75, max(1.10, zoom_end))
+    zoom_start = max(1.08, zoom_end - 0.12)
+    reason = f"Begärd lokal punch-zoom {zoom_start:.0%}–{zoom_end:.0%} på uppmätt moment vid {float(punch.get('t0') or 0):.2f}s."
+    return _zoom_range(
+        plan,
+        float(punch["t0"]),
+        float(punch["t1"]),
+        analysis,
+        zoom_start=zoom_start,
+        zoom_end=zoom_end,
+        reason=reason,
+        label="punch",
+    )
 
 
 def _zoom_reaction(plan: dict, analysis: dict) -> tuple[bool, str]:
@@ -1264,6 +1296,8 @@ def _apply_op(plan: dict, analysis: dict, op: dict, intent: dict, first: bool) -
         target_zoom = float(op.get("zoomEnd") or intent.get("zoom_percent") or 1.55)
         _zoom_main(plan, analysis, target_zoom)
         return True, "zoom"
+    if name == "punch_zoom":
+        return _apply_punch_zoom(plan, analysis, float(op.get("zoomEnd") or intent.get("zoom_percent") or 0) or None)
     if name == "remove_last_caption":
         return _remove_last_caption(plan)
     if name == "remove_word":
@@ -1308,6 +1342,7 @@ def _allowed_ops(intent: dict, first: bool) -> set[str]:
     mapping = {
         "trim_open": "trim_opening",
         "zoom_main": "zoom_main",
+        "punch_zoom": "punch_zoom",
         "remove_last_caption": "remove_last_caption",
         "remove_word": "remove_word",
         "remove_kind": "remove_kind",
@@ -1369,7 +1404,22 @@ def _rejects(before, after, intent, analysis, text, first) -> str | None:
         now = float(after["clips"][0]["sourceStart"])
         if now + 0.15 < origin + float(intent["trim_open"]):
             return "Modellen tog inte bort öppningen."
-    if intent.get("zoom_main"):
+    if intent.get("punch_zoom"):
+        from .story import build_story
+        punch = build_story(analysis).get("punch")
+        if not punch:
+            return "Ingen uppmätt rörelsetopp finns att punch-zooma på."
+        required_zoom = float(intent.get("zoom_percent") or punch.get("zoomEnd") or 1.36)
+        t0, t1 = float(punch["t0"]), float(punch["t1"])
+        local = [
+            clip for clip in after.get("clips") or []
+            if float(clip.get("sourceStart") or 0) < t1
+            and float(clip.get("sourceEnd") or 0) > t0
+            and clip.get("label") == "punch"
+        ]
+        if not local or max(float(clip.get("zoomEnd") or 1) for clip in local) < required_zoom - 0.02:
+            return f"Modellen lade inte in en lokal punch-zoom till {required_zoom:.0%} på den uppmätta rörelsetoppen."
+    elif intent.get("zoom_main"):
         before_zoom = max((float(clip.get("zoomEnd") or 1) for clip in (base or {}).get("clips") or []), default=1)
         after_zoom = max(float(clip.get("zoomEnd") or 1) for clip in after["clips"])
         required_zoom = float(intent.get("zoom_percent") or 1.4)
